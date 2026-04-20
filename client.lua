@@ -23,7 +23,6 @@
 --    ✔ SetEntityAsMissionEntity on all spawned entities
 --    ✔ RequestModelSync before every CreateVehicle/CreatePed
 --    ✔ RequestModelSync in SpawnReinforcements (was missing)
---    ✔ TaskVehicleChase(guard, driver) — PED target not vehicle
 --    ✔ TaskStartScenarioInPlace raw string — not GetHashKey int
 --    ✔ boomPrompt registered exactly once via boomPromptCreated
 --    ✔ isMissionActive=false before PlantAndExplode Wait()s
@@ -34,8 +33,13 @@
 --    ✔ Blip handles nilled after every RemoveBlip
 --    ✔ guards = {} reset in CleanupMission
 --    ✔ Fence blip created AFTER CleanupMission — was invisible
---    ✔ GetPedInVehicleSeat fallback for downed-driver edge case
 --    ✔ Reinforcement guards staggered left/right
+--    ✔ missionWagon nilled in CleanupMission — no stale handles
+--    ✔ Escort guards use TaskCombatPed(player) not TaskVehicleChase(driver)
+--    ✔ Driver dead check uses IsEntityDead + DoesEntityExist — no dismount false-positive
+--    ✔ AddExplosion uses type 0 — type 1 is GTA5 enum, invalid in RedM
+--    ✔ RPC.execute wrapped in pcall — prevents crash on server timeout
+--    ✔ Native hashes commented with their function names
 -- ================================================================
 
 local VORPcore = exports.vorp_core:GetCore()
@@ -92,6 +96,21 @@ local function RequestModelSync(model)
     end
 end
 
+-- ────────────────────────────────────────────────────────────────
+--  HELPER  SafeRPC
+--  Wraps RPC.execute in a pcall to prevent a client crash if the
+--  server is unavailable or the call times out.
+--  Returns: success (bool), result (value or nil)
+-- ────────────────────────────────────────────────────────────────
+local function SafeRPC(name, ...)
+    local ok, result = pcall(RPC.execute, name, ...)
+    if not ok then
+        print("[robbery] RPC failed for " .. name .. ": " .. tostring(result))
+        return false, nil
+    end
+    return true, result
+end
+
 -- ════════════════════════════════════════════════════════════════
 --  INTERACTION THREAD
 --  Waits for PlayerLoaded before doing anything.
@@ -114,8 +133,8 @@ Citizen.CreateThread(function()
         180.0, false, false
     )
     -- Full NPC lockdown — pattern from lxr-bounty-quests
-    Citizen.InvokeNative(0x283978A15512B2FE, starterPed, true)  -- network entity flag
-    SetEntityCanBeDamaged(starterPed, false)                     -- added from reference
+    Citizen.InvokeNative(0x283978A15512B2FE, starterPed, true)  -- NetworkSetEntityIsNetworked
+    SetEntityCanBeDamaged(starterPed, false)
     SetEntityInvincible(starterPed, true)
     FreezeEntityPosition(starterPed, true)
     SetBlockingOfNonTemporaryEvents(starterPed, true)
@@ -153,7 +172,9 @@ Citizen.CreateThread(function()
                 local now = GetGameTimer()
                 if now - lastLootCheck > LOOT_POLL_MS then
                     lastLootCheck = now
-                    hasLoot = RPC.execute('robbery:hasLockbox')
+                    -- FIX: SafeRPC wrapper — prevents crash if server times out
+                    local ok, result = SafeRPC('robbery:hasLockbox')
+                    hasLoot = ok and result or false
                 end
 
                 if hasLoot then
@@ -168,11 +189,12 @@ Citizen.CreateThread(function()
                 elseif not isMissionActive then
                     PromptSetActiveGroupThisFrame(startPrompt, CreateVarString(10, "LITERAL_STRING", "Robbery"))
                     if PromptHasHoldModeCompleted(startPrompt) then
-                        local res = RPC.execute('robbery:tryStart')
-                        if res.success then
+                        -- FIX: SafeRPC wrapper — prevents crash if server times out
+                        local ok, res = SafeRPC('robbery:tryStart')
+                        if ok and res and res.success then
                             StartMission()
                         else
-                            Notify(res.msg, 5000)
+                            Notify((res and res.msg) or "Something went wrong.", 5000)
                         end
                     end
                 end
@@ -229,7 +251,11 @@ function StartMission()
 
         local guard = CreateMissionNPC(nil, nil, GetEntityCoords(horse))
         SetPedIntoVehicle(guard, horse, -1)
-        TaskVehicleChase(guard, driver)   -- PED target — not vehicle handle
+
+        -- FIX: was TaskVehicleChase(guard, driver) — driver is inside the wagon so
+        -- guards would just shadow the wagon and never engage the player.
+        -- TaskCombatPed targets the player directly, matching reinforcement behaviour.
+        TaskCombatPed(guard, PlayerPedId(), 0, 16)
 
         table.insert(entities, horse)
         table.insert(guards,   guard)
@@ -244,6 +270,7 @@ function StartMission()
     )
 
     -- ── Wagon Blip (red enemy, entity-attached) ───────────────
+    -- 0x23F74C1382440316 = BlipAddForEntity
     wagonBlip = Citizen.InvokeNative(0x23F74C1382440316, GetHashKey("BLIP_STYLE_ENEMY"), missionWagon)
 
     -- ════════════════════════════════════════════════════════
@@ -313,10 +340,12 @@ function StartMission()
             end
 
             -- ── SUCCESS: driver + shooter dead ────────────────
-            -- Fallback: seat empty check for RedM edge case where
-            -- IsEntityDead returns false on a physically-downed ped
-            local driverDead  = IsEntityDead(driver)  or (GetPedInVehicleSeat(missionWagon, -1) == 0)
-            local shooterDead = IsEntityDead(shooter) or (GetPedInVehicleSeat(missionWagon,  0) == 0)
+            -- FIX: old fallback was GetPedInVehicleSeat == 0 which also fires
+            -- when the driver dismounts voluntarily (not dead), causing a false-
+            -- positive success. Replace with DoesEntityExist as the secondary
+            -- check — a deleted/removed ped always means they are neutralised.
+            local driverDead  = IsEntityDead(driver)  or not DoesEntityExist(driver)
+            local shooterDead = IsEntityDead(shooter) or not DoesEntityExist(shooter)
 
             if driverDead and shooterDead then
                 local backDoor = GetOffsetFromEntityInWorldCoords(missionWagon, 0.0, -3.5, 0.0)
@@ -336,7 +365,9 @@ function StartMission()
                     PromptSetActiveGroupThisFrame(boomPrompt, CreateVarString(10, "LITERAL_STRING", "Armored Wagon"))
 
                     if PromptHasHoldModeCompleted(boomPrompt) then
-                        if RPC.execute('robbery:checkDynamite') then
+                        -- FIX: SafeRPC wrapper — prevents crash if server times out
+                        local ok, hasDynamite = SafeRPC('robbery:checkDynamite')
+                        if ok and hasDynamite then
                             PromptDelete(boomPrompt)
                             boomPrompt = nil
 
@@ -352,6 +383,7 @@ function StartMission()
                             CleanupMission("Lockbox secured! Return to the fence.", 0)
 
                             if fenceBlip then RemoveBlip(fenceBlip) fenceBlip = nil end
+                            -- 0x554D9D10F6928432 = BlipAddForCoords
                             fenceBlip = Citizen.InvokeNative(
                                 0x554D9D10F6928432,
                                 GetHashKey("BLIP_STYLE_FRIENDLY"),
@@ -404,6 +436,11 @@ end
 --  PlantAndExplode
 --  TaskStartScenarioInPlace takes a RAW STRING — not a hash int.
 --  Using GetHashKey() here caused the animation to silently fail.
+--
+--  FIX: AddExplosion type changed from 1 to 0.
+--  Type 1 is the GTA5 grenade enum (EXP_TAG_GRENADE) and is not
+--  valid in RedM — it either does nothing or behaves incorrectly.
+--  Type 0 is the default/generic explosion in RDR2.
 -- ════════════════════════════════════════════════════════════════
 function PlantAndExplode(coords)
     TriggerServerEvent('robbery:consumeDynamite')
@@ -414,7 +451,8 @@ function PlantAndExplode(coords)
 
     Wait(3500)   -- fuse burn
 
-    AddExplosion(coords.x, coords.y, coords.z + 0.5, 1, 1.5, true, false, 1.8)
+    -- FIX: was type 1 (GTA5 grenade enum) — use 0 for default RDR2 explosion
+    AddExplosion(coords.x, coords.y, coords.z + 0.5, 0, 1.5, true, false, 1.8)
 
     Wait(500)    -- settle before granting lockbox
     TriggerServerEvent('robbery:giveLockbox')
@@ -459,6 +497,7 @@ end
 --  Blip nilling  — prevents double-RemoveBlip errors
 --  Batch delete  — one Wait(200) for all NetworkRequestControl,
 --                  then delete pass (no per-entity Wait lag)
+--  FIX: missionWagon nilled after deletion — no stale handles
 -- ════════════════════════════════════════════════════════════════
 function CleanupMission(msg, delay, fromServer)
     if isCleaningUp then return end
@@ -483,6 +522,9 @@ function CleanupMission(msg, delay, fromServer)
     guards          = {}
     isMissionActive = false
     isCleaningUp    = false
+
+    -- FIX: nil the wagon handle so nothing can reference a deleted entity
+    missionWagon = nil
 
     if not fromServer then
         TriggerServerEvent('robbery:endMissionServer')

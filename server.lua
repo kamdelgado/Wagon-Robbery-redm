@@ -5,6 +5,10 @@
 --  Verified against:
 --    docs.vorp-core.com (2026)
 --    iboss21/lxr-bounty-quests (multi-framework reference, 2026)
+--
+--  FIX: fencingInProgress[source] cleared in playerDropped —
+--       source IDs are recycled, so a dangling true entry would
+--       permanently block a new player who joins on the same ID.
 -- ================================================================
 
 local VORPcore = exports.vorp_core:GetCore()
@@ -34,6 +38,8 @@ math.randomseed(os.time())
 --    getItemCount(source, callback, item, metadata, percentage)
 --  Passing nil as callback returns synchronously.
 --  Always returns a number — never nil.
+--  NOTE: if vorp_inventory is updated, re-verify this nil-callback
+--  behaviour — a silent async break here is hard to debug.
 -- ────────────────────────────────────────────────────────────────
 local function getItemCount(src, itemName)
     local n = exports.vorp_inventory:getItemCount(src, nil, itemName)
@@ -195,8 +201,17 @@ end)
 --  playerDropped
 --  If the mission player disconnects, release the lock and
 --  broadcast forceCleanup to all clients.
+--
+--  FIX: fencingInProgress[source] is now cleared here.
+--  Source IDs are recycled by RedM — leaving a true entry causes
+--  the next player assigned that ID to be permanently locked out
+--  of fencing for the lifetime of the resource.
 -- ════════════════════════════════════════════════════════════════
 AddEventHandler('playerDropped', function()
+    -- FIX: always clear fencing lock on disconnect regardless of
+    -- whether they were the mission player
+    fencingInProgress[source] = nil
+
     if source == currentMissionPlayer then
         missionActive        = false
         currentMissionPlayer = nil
