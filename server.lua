@@ -6,9 +6,8 @@
 --    docs.vorp-core.com (2026)
 --    iboss21/lxr-bounty-quests (multi-framework reference, 2026)
 --
---  FIX: fencingInProgress[source] cleared in playerDropped —
---       source IDs are recycled, so a dangling true entry would
---       permanently block a new player who joins on the same ID.
+--  All tuneable values live in config.lua.
+--  Do not hardcode item names, payouts, or cooldowns here.
 -- ================================================================
 
 local VORPcore = exports.vorp_core:GetCore()
@@ -20,26 +19,14 @@ local missionStartTime     = nil
 local playerCooldowns      = {}   -- [identifier] = unix timestamp
 local fencingInProgress    = {}   -- [source]     = bool
 
--- ── Config ───────────────────────────────────────────────────────
-local Config = {
-    cooldownMinutes  = 60,
-    payoutMin        = 800,
-    payoutMax        = 1200,
-    watchdogMinutes  = 20,   -- server auto-reset if client never fires cleanup
-}
 -- ─────────────────────────────────────────────────────────────────
-
--- Seed randomiser on resource start (lxr-bounty-quests omits this — we keep it)
+-- Seed randomiser on resource start
 math.randomseed(os.time())
 
 -- ────────────────────────────────────────────────────────────────
 --  HELPER  getItemCount
---  Official vorp_inventory 3.6+ signature:
---    getItemCount(source, callback, item, metadata, percentage)
---  Passing nil as callback returns synchronously.
---  Always returns a number — never nil.
---  NOTE: if vorp_inventory is updated, re-verify this nil-callback
---  behaviour — a silent async break here is hard to debug.
+--  vorp_inventory 3.6+ — passing nil as callback returns
+--  synchronously. Re-verify this if vorp_inventory is updated.
 -- ────────────────────────────────────────────────────────────────
 local function getItemCount(src, itemName)
     local n = exports.vorp_inventory:getItemCount(src, nil, itemName)
@@ -49,7 +36,7 @@ end
 -- ════════════════════════════════════════════════════════════════
 --  WATCHDOG THREAD
 --  Releases missionActive if the client crashes and never calls
---  robbery:endMissionServer.  Fires once per minute.
+--  robbery:endMissionServer. Fires once per minute.
 -- ════════════════════════════════════════════════════════════════
 Citizen.CreateThread(function()
     while true do
@@ -89,14 +76,12 @@ RPC.register('robbery:tryStart', function(source)
         return {success = false, msg = "The law is watching. Wait " .. rem .. " more min(s)."}
     end
 
-    -- Use vorp_inventory export — char.getItemCount is legacy and
-    -- silently returns nil on vorp_inventory 3.6+
-    if getItemCount(_source, "dynamite") < 1 then
+    if getItemCount(_source, Config.dynamiteItem) < 1 then
         return {success = false, msg = "You need Dynamite to blow the wagon doors!"}
     end
 
     -- Prevent timing exploit: can't start while already holding a lockbox
-    if getItemCount(_source, "stolen_lockbox") > 0 then
+    if getItemCount(_source, Config.lockboxItem) > 0 then
         return {success = false, msg = "You already have a stolen lockbox. Fence it first!"}
     end
 
@@ -104,9 +89,9 @@ RPC.register('robbery:tryStart', function(source)
     currentMissionPlayer = _source
     missionStartTime     = os.time()
 
-    -- pcall: prevents server error if law script event doesn't exist
+    -- pcall: prevents server error if vorp_wanted doesn't exist
     pcall(function()
-        TriggerEvent('vorp_wanted:add', _source, 20, "Stagecoach Robbery")
+        TriggerEvent('vorp_wanted:add', _source, Config.wantedPoints, Config.wantedReason)
     end)
 
     return {success = true}
@@ -120,18 +105,18 @@ RegisterServerEvent('robbery:consumeDynamite')
 AddEventHandler('robbery:consumeDynamite', function()
     local _source = source
     if _source ~= currentMissionPlayer then return end
-    exports.vorp_inventory:subItem(_source, "dynamite", 1)
+    exports.vorp_inventory:subItem(_source, Config.dynamiteItem, 1)
 end)
 
 -- ════════════════════════════════════════════════════════════════
 --  RPCs: robbery:checkDynamite  /  robbery:hasLockbox
 -- ════════════════════════════════════════════════════════════════
 RPC.register('robbery:checkDynamite', function(source)
-    return getItemCount(source, "dynamite") > 0
+    return getItemCount(source, Config.dynamiteItem) > 0
 end)
 
 RPC.register('robbery:hasLockbox', function(source)
-    return getItemCount(source, "stolen_lockbox") > 0
+    return getItemCount(source, Config.lockboxItem) > 0
 end)
 
 -- ════════════════════════════════════════════════════════════════
@@ -142,15 +127,13 @@ RegisterServerEvent('robbery:giveLockbox')
 AddEventHandler('robbery:giveLockbox', function()
     local _source = source
     if _source ~= currentMissionPlayer then return end
-    exports.vorp_inventory:addItem(_source, "stolen_lockbox", 1)
+    exports.vorp_inventory:addItem(_source, Config.lockboxItem, 1)
 end)
 
 -- ════════════════════════════════════════════════════════════════
 --  robbery:fenceLoot
 --  Spam-protected with fencingInProgress lock.
---  Server-side inventory re-verify via export (not char method).
---  Reward via character.addCurrency(0 = cash).
---  Modern server notification via VORPcore.NotifyTip.
+--  Server-side inventory re-verify before paying out.
 -- ════════════════════════════════════════════════════════════════
 RegisterServerEvent('robbery:fenceLoot')
 AddEventHandler('robbery:fenceLoot', function()
@@ -165,24 +148,23 @@ AddEventHandler('robbery:fenceLoot', function()
         return
     end
 
-    if getItemCount(_source, "stolen_lockbox") < 1 then
+    if getItemCount(_source, Config.lockboxItem) < 1 then
         fencingInProgress[_source] = nil
         return
     end
 
-    exports.vorp_inventory:subItem(_source, "stolen_lockbox", 1)
+    exports.vorp_inventory:subItem(_source, Config.lockboxItem, 1)
 
     local character = user.getUsedCharacter
     local payout    = math.random(Config.payoutMin, Config.payoutMax)
     character.addCurrency(0, payout)   -- 0 = cash, 1 = gold
 
-    -- Modern server-side notify (Core object — not legacy TriggerClientEvent)
     VORPcore.NotifyTip(_source, "The Fence paid $" .. payout .. ". Ride easy.", 8000)
 
     playerCooldowns[character.identifier] = os.time() + (Config.cooldownMinutes * 60)
-    missionActive            = false
-    currentMissionPlayer     = nil
-    missionStartTime         = nil
+    missionActive              = false
+    currentMissionPlayer       = nil
+    missionStartTime           = nil
     fencingInProgress[_source] = nil
 end)
 
@@ -202,14 +184,11 @@ end)
 --  If the mission player disconnects, release the lock and
 --  broadcast forceCleanup to all clients.
 --
---  FIX: fencingInProgress[source] is now cleared here.
---  Source IDs are recycled by RedM — leaving a true entry causes
---  the next player assigned that ID to be permanently locked out
---  of fencing for the lifetime of the resource.
+--  fencingInProgress[source] cleared unconditionally — source IDs
+--  are recycled by RedM, so a dangling true entry would permanently
+--  block any new player assigned that same ID.
 -- ════════════════════════════════════════════════════════════════
 AddEventHandler('playerDropped', function()
-    -- FIX: always clear fencing lock on disconnect regardless of
-    -- whether they were the mission player
     fencingInProgress[source] = nil
 
     if source == currentMissionPlayer then
