@@ -9,7 +9,7 @@ game 'rdr3'
 name        'stagecoach_robbery'
 description 'Stagecoach robbery mission — VORP Core framework'
 author      'Kam and Claude'
-version     '1.0.0'
+version     '3.0.0'
 
 shared_scripts {
     'config.lua',
