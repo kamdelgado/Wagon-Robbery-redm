@@ -1,1 +1,1 @@
-Good luck fully fixing - IF you do fix it fully and get it properly working, dont be a d**k and sell it. Think of the actual redm community but i know no one ever does.
+Made this originally by myself, but Im to stupid for this and had AI basically fully fix and re do as I guess im to stupid for this lol. Has not been tested yet as dont have the time. If someone does test this and fix it (id imagine does need fixing it). Please for the love of redm release it for free, dont be greedy and sell it on.
