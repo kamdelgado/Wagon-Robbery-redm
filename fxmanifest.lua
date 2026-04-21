@@ -1,15 +1,8 @@
--- ================================================================
---  STAGECOACH ROBBERY  |  fxmanifest.lua
---  VORP Core 2025/2026  |  RedM / CFX
--- ================================================================
-
 fx_version 'cerulean'
+rdr3_warning 'I acknowledge that this is a prerelease build of RedM, and I am aware my resources *will* become incompatible once RedM ships.'
 game 'rdr3'
 
-name        'stagecoach_robbery'
-description 'Stagecoach robbery mission — VORP Core framework'
-author      'Kam and Claude'
-version     '3.0.0'
+lua54 'yes'
 
 shared_scripts {
     'config.lua',
@@ -21,9 +14,4 @@ client_scripts {
 
 server_scripts {
     'server.lua',
-}
-
-dependencies {
-    'vorp_core',
-    'vorp_inventory',
 }

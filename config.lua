@@ -1,203 +1,101 @@
--- ================================================================
---  STAGECOACH ROBBERY  |  config.lua
---  Shared script — loaded before client.lua and server.lua
---  VORP Core 2025/2026  |  Lua 5.4
--- ================================================================
---
---  Add to fxmanifest.lua:
---
---    shared_scripts {
---        'config.lua',
---    }
---    client_scripts {
---        'client.lua',
---    }
---    server_scripts {
---        'server.lua',
---    }
---
---  After adding this file, remove the local Config = { ... } blocks
---  from both client.lua and server.lua — Config is now global and
---  shared automatically by the shared_script manifest entry.
---
--- ================================================================
-
 Config = {}
 
--- ════════════════════════════════════════════════════════════════
---  LOCATIONS
---  All world positions used by the mission.
---  npcPos  — where the quest giver / fence NPC stands.
---            This same NPC handles both starting the robbery and
---            fencing the stolen lockbox afterwards.
---  spawnPos — where the armored wagon and its escort spawn.
---  loftPos  — the wagon's destination. If it reaches within
---             Config.wagonDestProximity of this point the player
---             fails the mission.
--- ════════════════════════════════════════════════════════════════
-Config.npcPos  = vector3(1433.2, 1332.1, 182.4)
-Config.spawnPos = vector3(1106.3, 1378.5, 178.5)
-Config.loftPos  = vector3(1131.2, 2372.9, 258.0)
+-- How long (minutes) before the same robbery location respawns after completion
+Config.CooldownMinutes = 15
 
--- ════════════════════════════════════════════════════════════════
---  MODELS
---  All ped and vehicle model strings used by the mission.
---  Change these to swap out visuals without touching script logic.
--- ════════════════════════════════════════════════════════════════
-Config.starterNpcModel = "u_m_m_valcrimereader_01"  -- Quest giver / Fence NPC
-Config.guardModel      = "s_m_m_pinkerton_01"        -- Driver, shooter, escorts, reinforcements
-Config.wagonModel      = "wagonarmoured01x"           -- Armored stagecoach
-Config.horseModel      = "a_c_horse_turkoman_gold"   -- Escort and reinforcement mounts
+-- How long (seconds) before an abandoned robbery auto-cancels (player walked away, died, etc.)
+Config.RobberyTimeout = 120
 
--- Heading the starter NPC faces when spawned (degrees, 180 = south)
-Config.starterNpcHeading = 180.0
+-- Distance (units) within which a player can see the prompt to rob
+Config.TriggerDistance = 10.0
 
--- Heading the wagon faces when spawned (degrees, 90 = east)
-Config.wagonHeading = 90.0
+-- Distance (units) the server validates the player must be within before allowing robbery start
+-- Kept tighter than TriggerDistance to prevent position exploits
+Config.MaxRobDistance = 15.0
 
--- ════════════════════════════════════════════════════════════════
---  ITEMS
---  vorp_inventory item names. Must match your items.json exactly.
--- ════════════════════════════════════════════════════════════════
-Config.dynamiteItem = "dynamite"       -- Consumed when blowing the wagon door
-Config.lockboxItem  = "stolen_lockbox" -- Granted on successful blow, fenced for payout
+-- How long the lockpick / loot progress bar runs (ms)
+Config.LootDuration = 8000
 
--- ════════════════════════════════════════════════════════════════
---  ECONOMY  (server-side)
---  cooldownMinutes — how long a player must wait between attempts.
---  payoutMin/Max   — cash range paid by the fence (math.random).
---  watchdogMinutes — server auto-releases missionActive if the
---                    client crashes and never fires endMissionServer.
---  wantedPoints    — bounty added via vorp_wanted on mission start.
--- ════════════════════════════════════════════════════════════════
-Config.cooldownMinutes  = 60
-Config.payoutMin        = 800
-Config.payoutMax        = 1200
-Config.watchdogMinutes  = 20
-Config.wantedPoints     = 20
-Config.wantedReason     = "Stagecoach Robbery"
+-- Required item to start the robbery (set to nil to require nothing)
+Config.RequiredItem = 'lockpick'
 
--- ════════════════════════════════════════════════════════════════
---  TIMING  (milliseconds unless noted)
---  missionTimeout     — total time allowed before auto-fail.
---  missionLoopMs      — main mission thread tick rate.
---  lootPollMs         — how often the client RPCs robbery:hasLockbox
---                       when standing near the NPC.
---  plantAnimMs        — WORLD_HUMAN_CROUCH_INSPECT animation length.
---  fuseBurnMs         — delay between animation end and explosion.
---  postExplosionMs    — delay between explosion and lockbox grant
---                       (lets the VFX settle).
--- ════════════════════════════════════════════════════════════════
-Config.missionTimeout  = 15 * 60 * 1000   -- 15 minutes
-Config.missionLoopMs   = 500
-Config.lootPollMs      = 2000
-Config.plantAnimMs     = 4000
-Config.fuseBurnMs      = 3500
-Config.postExplosionMs = 500
+-- Prompt key binding
+Config.PromptKey = 0x760A9C6F -- INPUT_CONTEXT
 
--- ════════════════════════════════════════════════════════════════
---  AI / COMBAT
---  escortCount         — mounted guards that ride alongside the wagon.
---  reinforcementCount  — guards spawned behind the player when all
---                        escorts are killed.
---  guardAccuracy       — SetPedAccuracy value (0–100).
---  guardWeapon         — weapon hash string given to all guards.
---  guardAmmo           — ammo count given with the weapon.
---  wagonSpeedNormal    — wagon drive speed before taking damage.
---  wagonSpeedAlarmed   — wagon drive speed after taking any damage.
---  drivingStyle        — TaskVehicleDriveToCoord flag bitfield.
---                        786603 = stop for vehicles + peds, avoid
---                        traffic, keep lane. Standard for RDR2 NPCs.
--- ════════════════════════════════════════════════════════════════
-Config.escortCount        = 5
-Config.reinforcementCount = 3
-Config.guardAccuracy      = 65
-Config.guardWeapon        = "WEAPON_RIFLE_CARCANO"
-Config.guardAmmo          = 999
-Config.wagonSpeedNormal   = 5.0
-Config.wagonSpeedAlarmed  = 12.0
-Config.drivingStyle       = 786603
+-- Wagon model hash to spawn (stagecoach)
+Config.WagonModel = `stagecoach`
 
--- Escort spawn layout relative to Config.spawnPos
--- escortSpreadStep   — x-axis spacing between each escort horse
--- escortSpreadOffset — x-axis base shift to centre the escort line
---                      (default: -(escortCount * escortSpreadStep / 2) = -10)
--- escortYOffset      — how far behind the wagon the escorts form up
-Config.escortSpreadStep   = 4.0
-Config.escortSpreadOffset = -10.0
-Config.escortYOffset      = -8.0
+-- Guard ped model hash
+Config.GuardModel = `A_M_M_RanchWorker01`
 
--- Reinforcement spawn offsets relative to the player
--- reinforcementLateral — left/right stagger distance (alternating each spawn)
--- reinforcementBase    — how far directly behind the player they start
--- reinforcementStep    — additional rearward spacing per spawn index
-Config.reinforcementLateral = 10.0
-Config.reinforcementBase    = -80.0
-Config.reinforcementStep    = -15.0
+-- Guard weapon hash
+Config.GuardWeapon = `WEAPON_REVOLVER_CATTLEMAN`
 
--- ════════════════════════════════════════════════════════════════
---  INTERACTION RANGES
---  npcActiveRange   — within this range the thread switches from
---                     1000ms sleep to 0ms (full resolution).
---  npcInteractRange — within this range prompts are shown.
---  doorProximity    — how close the player must be to the wagon's
---                     rear door to see the dynamite prompt.
---  wagonDestProximity — wagon within this distance of loftPos = fail.
---  wagonDoorOffset  — local offset from wagon origin to rear door.
--- ════════════════════════════════════════════════════════════════
-Config.npcActiveRange      = 50.0
-Config.npcInteractRange    = 3.0
-Config.doorProximity       = 3.0
-Config.wagonDestProximity  = 20.0
-Config.wagonDoorOffset     = vector3(0.0, -3.5, 0.0)
+-- Blip shown on map when wagon is active
+Config.ActiveBlip = {
+    sprite  = -1117567375, -- wagon blip sprite
+    color   = 1,           -- red
+    scale   = 0.8,
+    label   = 'Wagon Robbery',
+}
 
--- ════════════════════════════════════════════════════════════════
---  EXPLOSION
---  explosionType         — RDR2 explosion enum. 0 = default/generic.
---                          Do NOT use 1 — that is the GTA5 grenade
---                          enum and is invalid in RedM.
---  explosionScale        — blast radius scalar.
---  explosionHeightOffset — Z lift above coords before detonating,
---                          keeps the blast above ground level.
---  explosionCamShake     — camera shake intensity passed to AddExplosion.
--- ════════════════════════════════════════════════════════════════
-Config.explosionType         = 0
-Config.explosionScale        = 1.5
-Config.explosionHeightOffset = 0.5
-Config.explosionCamShake     = 1.8
+-- Job alerts – which jobs get notified when a robbery starts
+Config.JobsToAlert = { 'sheriff', 'marshall' }
 
--- ════════════════════════════════════════════════════════════════
---  PROMPTS
---  Text shown on each hold-prompt and its group label.
---  Changing these requires no logic changes — purely cosmetic.
--- ════════════════════════════════════════════════════════════════
-Config.promptTextStart    = "Start Stagecoach Robbery"
-Config.promptTextFence    = "Sell Stolen Goods"
-Config.promptTextDynamite = "Plant Dynamite"
+-- Whether to use the outsider_jobalerts resource for job notifications
+Config.UseOutsiderJobAlerts = false
+Config.OutsiderJobAlertCommand = 'wagonrobbery'
 
-Config.promptGroupRobbery = "Robbery"
-Config.promptGroupFence   = "Fence"
-Config.promptGroupWagon   = "Armored Wagon"
+-- Loot table: each entry rolls separately. 'chance' is 0.0–1.0
+Config.Loot = {
+    { item = 'goldnugget',  amount = 2, chance = 0.6,  label = 'Gold Nugget' },
+    { item = 'money',       amount = 50, chance = 0.8, label = 'Cash' },
+    { item = 'whiskey',     amount = 1, chance = 0.4,  label = 'Whiskey' },
+    { item = 'ammo_rifle',  amount = 20, chance = 0.3, label = 'Rifle Ammo' },
+}
 
--- ════════════════════════════════════════════════════════════════
---  NOTIFICATIONS
---  All user-facing messages in one place.
---  Duration values are in milliseconds.
--- ════════════════════════════════════════════════════════════════
-Config.notify = {
-    -- Mission flow
-    missionStart       = { msg = "Go stop the armored stagecoach!",        dur = 8000 },
-    reinforcements     = { msg = "Lawmen reinforcements incoming!",         dur = 5000 },
-    noDynamite         = { msg = "You need Dynamite!",                     dur = 4000 },
-    lockboxSecured     = { msg = "Lockbox secured! Head to the fence.",     dur = 6000 },
-    lockboxCleanup     = { msg = "Lockbox secured! Return to the fence.",   dur = 6000 },
+-- Robbery encounter locations
+-- coords  = where the wagon spawns (vector4: x,y,z,heading)
+-- guards  = table of guard spawn positions relative to wagon (or world coords)
+-- town    = district name shown in job alerts
+Config.Encounters = {
+    {
+        id      = 1,
+        name    = 'Flat Iron Lake Road',
+        town    = 'Blackwater',
+        coords  = vector4(-862.35, -1280.22, 43.85, 270.0),
+        guards  = {
+            vector4(-855.0, -1280.22, 43.85, 90.0),
+            vector4(-870.0, -1278.0,  43.85, 80.0),
+        },
+    },
+    {
+        id      = 2,
+        name    = 'Flat Neck Station Road',
+        town    = 'Valentine',
+        coords  = vector4(-289.47, 774.2, 117.38, 130.0),
+        guards  = {
+            vector4(-283.0, 780.0, 117.38, 310.0),
+            vector4(-296.0, 769.0, 117.38, 130.0),
+        },
+    },
+}
 
-    -- Failures
-    failUnexpected     = { msg = "Mission ended unexpectedly.",             dur = 5000 },
-    failTimeout        = { msg = "Mission timed out.",                      dur = 5000 },
-    failWagonEscaped   = { msg = "Failed: The wagon reached safety!",       dur = 5000 },
-    failPlayerDied     = { msg = "Failed: You died.",                       dur = 5000 },
+-- Notification textures (used with VorpCore left-tip notifications)
+Config.Textures = {
+    alert = { 'generic_textures', 'hud_corner' },
+}
 
-    -- Generic fallback (RPC error)
-    genericError       = { msg = "Something went wrong.",                   dur = 5000 },
+Config.Texts = {
+    Prompt          = 'Rob Wagon',
+    TooFar          = 'You are too far from the wagon.',
+    AlreadyRobbed   = 'This wagon has already been robbed.',
+    InProgress      = 'Someone else is already robbing this wagon.',
+    NoItem          = 'You need a lockpick to rob this wagon.',
+    RobberyStart    = 'You begin breaking into the strongbox...',
+    RobberySuccess  = 'You loot the wagon!',
+    RobberyFail     = 'The robbery failed.',
+    FoundItem       = 'You found',
+    NothingFound    = 'The strongbox was empty.',
+    GuardsAlert     = 'A wagon robbery has been reported!',
 }
