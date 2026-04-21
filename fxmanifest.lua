@@ -2,6 +2,11 @@ fx_version 'cerulean'
 rdr3_warning 'I acknowledge that this is a prerelease build of RedM, and I am aware my resources *will* become incompatible once RedM ships.'
 game 'rdr3'
 
+name        'stagecoach_robbery'
+description 'Stagecoach robbery mission — VORP Core framework'
+author      'kam+claude'
+version     '4.0.0'
+
 lua54 'yes'
 
 shared_scripts {
