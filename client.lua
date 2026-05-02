@@ -1,305 +1,249 @@
 ---@diagnostic disable: undefined-global
 
 --[[
-    client.lua — Wagon Robbery (VORP / RedM)
+    client.lua – Armoured Wagon Robbery
+    ════════════════════════════════════════════════════════════════════════════
 
-    DESIGN PRINCIPLES (fixes for the AI-generated version):
-    ─────────────────────────────────────────────────────────
-    1. NO CreateVehicle / CreatePed here. Wagons and guards are spawned by the
-       server. This client resolves server entities using NetworkGetEntityFromNetworkId.
+    PATTERNS TAKEN FROM REAL SCRIPTS:
+    ─────────────────────────────────────────────────────────────────────────
+    • Prompt loop structure:  outsider_grave_robbery (repeat-until, optimised
+      sleep, PromptGroup, UiPromptSetActiveGroupThisFrame)
+    • Minigame integration:   syn_minigame export taskBar(difficulty, skillGap)
+    • Notification:           TriggerEvent("vorp:TipBottom", …) from outsider
+    • NotifyLeft (job alert): VorpCore.NotifyLeft from outsider server → mirrored
+      here for VFX notifications on client
+    • NPC task assignment:    activating client owns the AI tasks because
+      server-side TaskVehicleDriveToCoordLongrange is not available in OneSync
+    • Guard tracking thread:  repeat-until loop with configurable sleep,
+      mirroring outsider's digging_timer pattern
+    • Entity resolution:      waitForNetEntity() with explicit timeout – no
+      infinite loops (lesson from outsider's while-not-HasModelLoaded pattern)
 
-    2. The main proximity loop sleeps aggressively (1000ms when far, 0ms when
-       close) so it doesn't tank resmon for every player.
-
-    3. All robbery authority is on the server. The client only fires animations
-       and progress bars after receiving explicit server approval via
-       'wagonrobbery:beginLoot'.
-
-    4. A single PromptGroup per encounter is created/destroyed as needed, not
-       recreated every frame.
+    ZERO CreateVehicle / CreatePed HERE – all entities are server-spawned and
+    resolved via NetworkGetEntityFromNetworkId().
 --]]
 
--- ─── State ───────────────────────────────────────────────────────────────────
+-- ─── Shared constants from Config ─────────────────────────────────────────────
+local TEXTS    = Config.Texts
+local TEXTURES = Config.Textures
 
--- activeEncounters[encounterId] = { wagonNetId, guardNetIds, blip, promptGroup, prompts }
-local activeEncounters = {}
+-- ─── Prompt Group (single persistent group, same approach as outsider) ────────
+local PromptGroup   = GetRandomIntInRange(0, 0xffffff)
 
--- Are we currently mid-loot animation?
-local isLooting = false
+-- Prompt handles – created/destroyed as needed
+local starterPrompt = nil
+local wagonPrompt   = nil
 
--- Which encounter are we looting (nil if none)
-local currentLootEncounter = nil
+-- ─── Client State ─────────────────────────────────────────────────────────────
+local isActivator    = false
+local missionPhase   = 'idle'    -- mirrors server phase
 
--- ─── Helpers ─────────────────────────────────────────────────────────────────
+local wagonEnt       = nil
+local driverEnt      = nil
+local gunnerEnt      = nil
+local guardEnts      = {}
+local guardHorseEnts = {}
+local reinfEnts      = {}
+local reinfHorseEnts = {}
 
+local totalHostiles  = 0
+local totalReinf     = 0
+
+local wagonBlip      = nil
+local starterPedEnt  = nil   -- our local client-only ped at Tesla Tower
+
+-- Thread kill flags
+local monitorGuardsAlive = false
+local monitorReinfAlive  = false
+local deathWatchAlive    = false
+local wagonProxAlive     = false
+
+-- ─── Notification helper (matches outsider_grave_robbery exactly) ─────────────
 local function notify(msg)
     TriggerEvent('vorp:TipBottom', msg, 5000)
 end
 
---[[
-    Wait until the given netId resolves to a valid local entity handle.
-    Returns the entity handle, or nil if it never resolved.
-    Timeout after 5 seconds to avoid infinite loops.
---]]
-local function waitForEntity(netId, timeout)
-    timeout = timeout or 5000
+-- ─── Debug helper ─────────────────────────────────────────────────────────────
+local function dbg(...)
+    if Config.Debug then print('[WagonRob:Client]', ...) end
+end
+
+-- ─── Model loader (mirrors outsider pattern: while not HasModelLoaded) ────────
+local function loadModel(model)
+    if HasModelLoaded(model) then return true end
+    RequestModel(model, false)
+    local t = 0
+    while not HasModelLoaded(model) and t < 5000 do
+        Wait(100); t = t + 100
+    end
+    return HasModelLoaded(model)
+end
+
+local function loadAnimDict(dict)
+    if HasAnimDictLoaded(dict) then return true end
+    RequestAnimDict(dict)
+    local t = 0
+    while not HasAnimDictLoaded(dict) and t < 5000 do
+        Wait(100); t = t + 100
+    end
+    return HasAnimDictLoaded(dict)
+end
+
+-- ─── Wait for a server netId to resolve into a local entity ──────────────────
+-- Has a hard timeout so we never hang in an infinite loop.
+local function waitForNetEntity(netId, timeout)
+    if not netId then return nil end
+    timeout = timeout or 8000
     local elapsed = 0
     while elapsed < timeout do
         if NetworkDoesEntityExistWithNetworkId(netId) then
             local ent = NetworkGetEntityFromNetworkId(netId)
-            if DoesEntityExist(ent) then
-                return ent
-            end
+            if DoesEntityExist(ent) then return ent end
         end
-        Wait(100)
-        elapsed = elapsed + 100
+        Wait(150); elapsed = elapsed + 150
     end
+    dbg('waitForNetEntity timed out for netId=' .. tostring(netId))
     return nil
 end
 
---[[
-    Create the interaction prompt for an encounter.
-    Returns the promptGroup handle and prompt handle.
---]]
-local function createPrompt(encounterId)
-    local group = GetRandomIntInRange(0, 0xffffff)
-    local prompt = UiPromptRegisterBegin()
-    UiPromptSetControlAction(prompt, Config.PromptKey)
-    local str = VarString(10, 'LITERAL_STRING', Config.Texts.Prompt)
-    UiPromptSetText(prompt, str)
-    UiPromptSetEnabled(prompt, true)
-    UiPromptSetVisible(prompt, true)
-    UiPromptSetStandardMode(prompt, true)
-    UiPromptSetGroup(prompt, group, 0)
-    UiPromptRegisterEnd(prompt)
-    return group, prompt
+-- ─── Prompt helpers ───────────────────────────────────────────────────────────
+-- Standard-mode prompt: single press (used for starter ped & loot stage).
+local function makeStandardPrompt(label)
+    local p = UiPromptRegisterBegin()
+    UiPromptSetControlAction(p, Config.PromptKey)
+    UiPromptSetText(p, VarString(10, 'LITERAL_STRING', label))
+    UiPromptSetEnabled(p, true)
+    UiPromptSetVisible(p, true)
+    UiPromptSetStandardMode(p, true)
+    UiPromptSetGroup(p, PromptGroup, 0)
+    UiPromptRegisterEnd(p)
+    return p
 end
 
-local function deletePrompt(promptHandle)
-    if promptHandle then
-        UiPromptDelete(promptHandle)
-    end
+local function deletePrompt(p)
+    if p then pcall(UiPromptDelete, p) end
 end
 
-local function addBlip(encounterId)
-    local enc = Config.Encounters[encounterId]
-    if not enc then return nil end
-    local c = enc.coords
-    local blip = BlipAddForCoords(Config.ActiveBlip.sprite, c.x, c.y, c.z)
-    BlipSetRotation(blip, 0)
-    BlipSetScale(blip, Config.ActiveBlip.scale)
-    BlipAddModifier(blip, Config.ActiveBlip.color)
-    local label = VarString(10, 'LITERAL_STRING', Config.ActiveBlip.label)
+-- ─── Blip ─────────────────────────────────────────────────────────────────────
+local function addBlip()
+    if wagonBlip and DoesBlipExist(wagonBlip) then RemoveBlip(wagonBlip) end
+    if not (wagonEnt and DoesEntityExist(wagonEnt)) then return end
+    wagonBlip = BlipAddForEntity(Config.Blip.sprite, wagonEnt)
+    BlipSetRotation(wagonBlip, 0)
+    BlipSetScale(wagonBlip, Config.Blip.scale)
+    BlipAddModifier(wagonBlip, Config.Blip.color)
     BeginTextCommandSetBlipName('LITERAL_STRING')
-    AddTextComponentSubstringPlayerName(enc.name)
-    EndTextCommandSetBlipName(blip)
-    return blip
+    AddTextComponentSubstringPlayerName(Config.Blip.label)
+    EndTextCommandSetBlipName(wagonBlip)
 end
 
-local function removeBlip(blip)
-    if blip and DoesBlipExist(blip) then
-        RemoveBlip(blip)
+local function removeBlip()
+    if wagonBlip and DoesBlipExist(wagonBlip) then RemoveBlip(wagonBlip) end
+    wagonBlip = nil
+end
+
+-- ─── NPC AI (applied by activating client after netId resolves) ───────────────
+local function applyNpcAI(ped, targetPed)
+    if not (ped and DoesEntityExist(ped)) then return end
+    SetPedAccuracy(ped, Config.NpcAccuracy)
+    SetPedCombatAbility(ped, Config.NpcCombatAbility)
+    SetPedCombatAttributes(ped, 2,  true)
+    SetPedCombatAttributes(ped, 5,  true)
+    SetPedCombatAttributes(ped, 46, true)
+    SetPedCombatAttributes(ped, 52, true)
+    if targetPed and DoesEntityExist(targetPed) then
+        TaskCombatPed(ped, targetPed, 0, 16)
     end
 end
 
--- ─── Server Events ────────────────────────────────────────────────────────────
+-- ─── Full client reset ────────────────────────────────────────────────────────
+local function fullReset()
+    dbg('fullReset()')
+    isActivator      = false
+    missionPhase     = 'idle'
+    wagonEnt         = nil; driverEnt  = nil; gunnerEnt  = nil
+    guardEnts        = {}; guardHorseEnts = {}
+    reinfEnts        = {}; reinfHorseEnts = {}
+    totalHostiles    = 0; totalReinf = 0
+    monitorGuardsAlive = false
+    monitorReinfAlive  = false
+    deathWatchAlive    = false
+    wagonProxAlive     = false
+    removeBlip()
+    deletePrompt(wagonPrompt); wagonPrompt = nil
+end
 
---[[
-    Server tells us a new encounter is active.
-    We record the netIds and create a blip. The proximity loop does the rest.
---]]
-RegisterNetEvent('wagonrobbery:syncEncounter')
-AddEventHandler('wagonrobbery:syncEncounter', function(encounterId, wagonNetId, guardNetIds)
-    -- Clean up any stale data for this encounter first
-    if activeEncounters[encounterId] then
-        removeBlip(activeEncounters[encounterId].blip)
-        deletePrompt(activeEncounters[encounterId].prompt)
+-- ─── Count dead among a table ─────────────────────────────────────────────────
+local function countDead(tbl)
+    local dead = 0
+    for _, e in ipairs(tbl) do
+        if DoesEntityExist(e) and IsEntityDead(e) then dead = dead + 1 end
     end
+    return dead
+end
 
-    local blip = addBlip(encounterId)
-
-    activeEncounters[encounterId] = {
-        wagonNetId  = wagonNetId,
-        guardNetIds = guardNetIds,
-        blip        = blip,
-        promptGroup = nil,
-        prompt      = nil,
-        inRange     = false,
-    }
-end)
-
---[[
-    Server tells us to wipe the encounter (robbery done / cooldown started).
---]]
-RegisterNetEvent('wagonrobbery:clearEncounter')
-AddEventHandler('wagonrobbery:clearEncounter', function(encounterId)
-    local enc = activeEncounters[encounterId]
-    if not enc then return end
-
-    removeBlip(enc.blip)
-    deletePrompt(enc.prompt)
-    activeEncounters[encounterId] = nil
-
-    -- If we were looting this one, cancel
-    if currentLootEncounter == encounterId then
-        isLooting = false
-        currentLootEncounter = nil
-        ClearPedTasks(PlayerPedId())
-    end
-end)
-
---[[
-    Server authorises OUR robbery attempt — play loot animation then report back.
---]]
-RegisterNetEvent('wagonrobbery:beginLoot')
-AddEventHandler('wagonrobbery:beginLoot', function(encounterId)
-    if isLooting then return end
-    isLooting = true
-    currentLootEncounter = encounterId
-
-    local ped = PlayerPedId()
-    notify(Config.Texts.RobberyStart)
-
-    -- Play a loot animation while the "progress bar" timer runs
-    local animDict = 'amb_camp@world_human_crouch_idle@male@idle_a'
-    local animName = 'idle_a'
-
-    if not HasAnimDictLoaded(animDict) then
-        RequestAnimDict(animDict)
-        local t = 0
-        while not HasAnimDictLoaded(animDict) and t < 3000 do
-            Wait(100)
-            t = t + 100
-        end
-    end
-
-    if HasAnimDictLoaded(animDict) then
-        TaskPlayAnim(ped, animDict, animName, 1.0, 1.0, Config.LootDuration, 1, 0, false, false, false)
-    end
-
-    -- Show a simple text countdown (replace with your progress bar if you have one)
-    local elapsed = 0
-    local cancelled = false
-
-    while elapsed < Config.LootDuration do
-        Wait(500)
-        elapsed = elapsed + 500
-
-        -- If the encounter was cleared from under us (robbery cancelled by server)
-        if not activeEncounters[encounterId] then
-            cancelled = true
-            break
-        end
-
-        -- If the player moved too far, cancel
-        local enc = activeEncounters[encounterId]
-        if enc then
-            local wagon = waitForEntity(enc.wagonNetId, 100)
-            if wagon then
-                local dist = #(GetEntityCoords(ped) - GetEntityCoords(wagon))
-                if dist > Config.MaxRobDistance then
-                    cancelled = true
-                    TriggerServerEvent('wagonrobbery:cancelRob', encounterId)
-                    break
-                end
-            end
-        end
-    end
-
-    ClearPedTasks(ped)
-    RemoveAnimDict(animDict)
-
-    if not cancelled then
-        notify(Config.Texts.RobberySuccess)
-        TriggerServerEvent('wagonrobbery:completeLoot', encounterId)
-    else
-        notify(Config.Texts.RobberyFail)
-    end
-
-    isLooting = false
-    currentLootEncounter = nil
-end)
-
---[[
-    Server notified us the guards are now active (another player started robbing).
-    Nothing to do visually for now — guards are server-side entities and will
-    replicate automatically via OneSync.
---]]
-RegisterNetEvent('wagonrobbery:guardsAlerted')
-AddEventHandler('wagonrobbery:guardsAlerted', function(encounterId)
-    -- Optional: play a distant gunshot sound, show a screen flash, etc.
-end)
-
---[[
-    Server says robbery was cancelled (timeout, player dropped, etc.)
---]]
-RegisterNetEvent('wagonrobbery:robberyCancelled')
-AddEventHandler('wagonrobbery:robberyCancelled', function(encounterId)
-    if currentLootEncounter == encounterId then
-        isLooting = false
-        currentLootEncounter = nil
-        ClearPedTasks(PlayerPedId())
-        notify(Config.Texts.RobberyFail)
-    end
-end)
-
--- ─── Main Proximity Loop ─────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- STARTER PED: spawn + prompt loop
+-- Mirrors outsider_grave_robbery's CreateThread / proximity loop exactly.
+-- ═══════════════════════════════════════════════════════════════════════════════
 
 CreateThread(function()
-    -- Wait until the player is fully in session before doing anything
     repeat Wait(5000) until LocalPlayer.state.IsInSession
 
-    -- Ask server for current encounter states (handles late joins / reconnects)
-    TriggerServerEvent('wagonrobbery:requestSync')
+    local pc = Config.StarterPed.coords
+    if loadModel(Config.StarterPed.model) then
+        starterPedEnt = CreatePed(Config.StarterPed.model, pc.x, pc.y, pc.z, pc.w, false, false)
+        if DoesEntityExist(starterPedEnt) then
+            SetEntityInvincible(starterPedEnt, true)
+            FreezeEntityPosition(starterPedEnt, true)
+            SetBlockingOfNonTemporaryEvents(starterPedEnt, true)
+            SetEntityAsMissionEntity(starterPedEnt, true, true)
+            dbg('Starter ped spawned.')
+        else
+            print('[WagonRobbery] ERROR: Could not create starter ped. Verify Config.StarterPed.model.')
+        end
+        SetModelAsNoLongerNeeded(Config.StarterPed.model)
+    else
+        print('[WagonRobbery] ERROR: Starter ped model failed to load.')
+    end
+end)
+
+-- Build starter prompt once, reuse it every frame (outsider style)
+CreateThread(function()
+    repeat Wait(5000) until LocalPlayer.state.IsInSession
+
+    starterPrompt = makeStandardPrompt(TEXTS.StartPrompt)
 
     while true do
         local sleep = 1000
-        local ped   = PlayerPedId()
+        local pped  = PlayerPedId()
+        local isdead = IsEntityDead(pped)
 
-        if not IsEntityDead(ped) then
-            local pcoords = GetEntityCoords(ped)
+        if not isdead and starterPedEnt and DoesEntityExist(starterPedEnt) then
+            local dist = #(GetEntityCoords(pped) - GetEntityCoords(starterPedEnt))
 
-            for encounterId, enc in pairs(activeEncounters) do
+            if dist < Config.PedTriggerDist then
+                -- Enter tight loop – same pattern as outsider's repeat…until
+                repeat
+                    pped   = PlayerPedId()
+                    isdead = IsEntityDead(pped)
+                    dist   = #(GetEntityCoords(pped) - GetEntityCoords(starterPedEnt))
+                    sleep  = 0
 
-                -- Resolve the wagon entity from its network ID
-                local wagon = nil
-                if NetworkDoesEntityExistWithNetworkId(enc.wagonNetId) then
-                    wagon = NetworkGetEntityFromNetworkId(enc.wagonNetId)
-                end
+                    -- Show the prompt group header (outsider's UiPromptSetActiveGroupThisFrame)
+                    UiPromptSetActiveGroupThisFrame(
+                        PromptGroup,
+                        VarString(10, 'LITERAL_STRING', 'Armoured Wagon'),
+                        0, 0, 0, 0
+                    )
 
-                if wagon and DoesEntityExist(wagon) then
-                    local dist = #(pcoords - GetEntityCoords(wagon))
-
-                    if dist < Config.TriggerDistance then
-                        -- Player is close — switch to high-frequency loop for this encounter
-                        sleep = 0
-                        enc.inRange = true
-
-                        -- Create prompt on first entry
-                        if not enc.prompt then
-                            enc.promptGroup, enc.prompt = createPrompt(encounterId)
-                        end
-
-                        -- Show prompt header
-                        local label = VarString(10, 'LITERAL_STRING', Config.Encounters[encounterId].name)
-                        UiPromptSetActiveGroupThisFrame(enc.promptGroup, label, 0, 0, 0, 0)
-
-                        -- Check if player pressed the prompt
-                        if not isLooting and UiPromptHasStandardModeCompleted(enc.prompt, 0) then
-                            TriggerServerEvent('wagonrobbery:requestRob', encounterId)
-                            Wait(2000) -- debounce
-                        end
-
-                    else
-                        -- Player left range — destroy prompt, reset flag
-                        if enc.inRange then
-                            deletePrompt(enc.prompt)
-                            enc.prompt      = nil
-                            enc.promptGroup = nil
-                            enc.inRange     = false
-                        end
+                    if UiPromptHasStandardModeCompleted(starterPrompt, 0) then
+                        TriggerServerEvent('wagonrobbery:requestStart')
+                        Wait(3000)  -- debounce
                     end
-                end
+
+                    Wait(sleep)
+                until dist > Config.PedTriggerDist or isdead
             end
         end
 
@@ -307,17 +251,414 @@ CreateThread(function()
     end
 end)
 
--- ─── Resource Stop Cleanup ────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Mission Started (activating player only)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:missionStarted')
+AddEventHandler('wagonrobbery:missionStarted', function(data)
+    dbg('missionStarted received')
+    isActivator   = true
+    missionPhase  = 'guards'
+    totalHostiles = data.totalHostiles
+
+    notify(TEXTS.MissionStarted)
+
+    -- ── Resolve wagon ──────────────────────────────────────────────────────────
+    wagonEnt = waitForNetEntity(data.wagonNetId)
+    if not wagonEnt then
+        print('[WagonRobbery] Client: wagon entity never resolved. netId=' .. tostring(data.wagonNetId))
+        return
+    end
+    dbg('Wagon resolved, handle=' .. wagonEnt)
+    addBlip()
+
+    -- ── Resolve driver + issue drive task ─────────────────────────────────────
+    if data.driverNetId then
+        driverEnt = waitForNetEntity(data.driverNetId)
+        if driverEnt and wagonEnt then
+            local dest = data.wagonDest
+            TaskVehicleDriveToCoordLongrange(
+                driverEnt, wagonEnt,
+                dest.x, dest.y, dest.z,
+                Config.WagonSpeed,
+                Config.WagonDriveMode,
+                10.0
+            )
+            dbg('Drive task set on driver.')
+        end
+    end
+
+    -- ── Resolve gunner + combat AI ────────────────────────────────────────────
+    if data.gunnerNetId then
+        gunnerEnt = waitForNetEntity(data.gunnerNetId)
+        if gunnerEnt then applyNpcAI(gunnerEnt, PlayerPedId()) end
+    end
+
+    -- ── Resolve guards + set escort AI ────────────────────────────────────────
+    guardEnts = {}; guardHorseEnts = {}
+    local myPed  = PlayerPedId()
+    local dest   = data.wagonDest
+
+    for i, netId in ipairs(data.guardNetIds) do
+        local guard = waitForNetEntity(netId)
+        if guard then
+            guardEnts[#guardEnts+1] = guard
+            applyNpcAI(guard, myPed)
+
+            local horseNId = data.guardHorseNetIds[i]
+            if horseNId then
+                local horse = waitForNetEntity(horseNId)
+                if horse then
+                    guardHorseEnts[#guardHorseEnts+1] = horse
+                    -- Guard's horse follows the same wagon route
+                    TaskVehicleDriveToCoordLongrange(
+                        guard, horse,
+                        dest.x, dest.y, dest.z,
+                        Config.WagonSpeed,
+                        Config.WagonDriveMode,
+                        10.0
+                    )
+                end
+            end
+        end
+    end
+    dbg(('Guards resolved: %d'):format(#guardEnts))
+
+    -- ── Thread: monitor guard deaths ──────────────────────────────────────────
+    -- Pattern: repeat-until, 2 s sleep, mirrors outsider digging_timer
+    monitorGuardsAlive = true
+    CreateThread(function()
+        repeat
+            Wait(2000)
+            if not monitorGuardsAlive or missionPhase ~= 'guards' then break end
+
+            local dead = countDead(guardEnts)
+            if gunnerEnt and DoesEntityExist(gunnerEnt) and IsEntityDead(gunnerEnt) then
+                dead = dead + 1
+            end
+            dbg(('Guards dead: %d/%d'):format(dead, totalHostiles))
+
+            if dead >= totalHostiles then
+                monitorGuardsAlive = false
+                missionPhase = 'dynamite'
+                TriggerServerEvent('wagonrobbery:guardsEliminated')
+                notify(TEXTS.AllGuardsDead)
+            end
+        until not monitorGuardsAlive
+    end)
+
+    -- ── Thread: death watch (player dies = fail) ──────────────────────────────
+    deathWatchAlive = true
+    CreateThread(function()
+        repeat
+            Wait(1000)
+            if not deathWatchAlive or missionPhase == 'idle' then break end
+            if IsEntityDead(PlayerPedId()) then
+                deathWatchAlive = false
+                notify(TEXTS.MissionFailed)
+                TriggerServerEvent('wagonrobbery:playerDied')
+                fullReset()
+            end
+        until not deathWatchAlive
+    end)
+
+    -- ── Thread: wagon proximity (dynamite prompt + loot prompt) ───────────────
+    wagonProxAlive = true
+    CreateThread(function()
+        local lastPhasePromptBuilt = nil
+
+        while wagonProxAlive and isActivator do
+            local sleep  = 1000
+            local phase  = missionPhase
+
+            if (phase == 'dynamite' or phase == 'loot') and
+               wagonEnt and DoesEntityExist(wagonEnt) then
+
+                local pped  = PlayerPedId()
+                local dist  = #(GetEntityCoords(pped) - GetEntityCoords(wagonEnt))
+
+                if dist < Config.WagonTriggerDist then
+                    sleep = 0
+
+                    -- Rebuild prompt only if phase changed
+                    if lastPhasePromptBuilt ~= phase then
+                        deletePrompt(wagonPrompt)
+                        local label = (phase == 'dynamite') and TEXTS.PlaceDynamitePrompt or TEXTS.LootPrompt
+                        wagonPrompt = makeStandardPrompt(label)
+                        lastPhasePromptBuilt = phase
+                    end
+
+                    UiPromptSetActiveGroupThisFrame(
+                        PromptGroup,
+                        VarString(10, 'LITERAL_STRING', Config.Blip.label),
+                        0, 0, 0, 0
+                    )
+
+                    if UiPromptHasStandardModeCompleted(wagonPrompt, 0) then
+                        deletePrompt(wagonPrompt); wagonPrompt = nil
+                        lastPhasePromptBuilt = nil
+
+                        if phase == 'dynamite' then
+                            -- Gate so we can't fire this twice
+                            missionPhase = 'placing_dynamite'
+
+                            -- Run the syn_minigame skill check (same export
+                            -- outsider_grave_robbery references)
+                            CreateThread(function()
+                                local result = exports['syn_minigame']:taskBar(
+                                    Config.Minigame.difficulty,
+                                    Config.Minigame.skillGap
+                                )
+
+                                if result == 100 then
+                                    -- Play a short dynamite-place animation
+                                    local ped      = PlayerPedId()
+                                    local animDict = 'melee@ground@base'
+                                    local animClip = 'ground_attack_0'
+                                    if loadAnimDict(animDict) then
+                                        TaskPlayAnim(ped, animDict, animClip,
+                                            1.0, 1.0, 2500, 1, 0, false, false, false)
+                                        Wait(2400)
+                                        ClearPedTasks(ped)
+                                        RemoveAnimDict(animDict)
+                                    end
+                                    notify(TEXTS.DynamitePlaced)
+                                    TriggerServerEvent('wagonrobbery:dynamitePlaced')
+                                    -- Phase will be updated to 'fuse' by server event
+                                else
+                                    -- Minigame failed → revert so they can try again
+                                    notify(TEXTS.MinigameFailed)
+                                    missionPhase = 'dynamite'
+                                end
+                            end)
+
+                        elseif phase == 'loot' then
+                            missionPhase    = 'rewarding'
+                            wagonProxAlive  = false
+                            TriggerServerEvent('wagonrobbery:lootComplete')
+                            removeBlip()
+                        end
+
+                        Wait(2000) -- debounce
+                    end
+
+                else
+                    -- Left range: destroy stale prompt
+                    if lastPhasePromptBuilt then
+                        deletePrompt(wagonPrompt); wagonPrompt = nil
+                        lastPhasePromptBuilt = nil
+                    end
+                end
+            else
+                -- Phase doesn't need this prompt; destroy if leftover
+                if lastPhasePromptBuilt then
+                    deletePrompt(wagonPrompt); wagonPrompt = nil
+                    lastPhasePromptBuilt = nil
+                end
+            end
+
+            Wait(sleep)
+        end
+
+        deletePrompt(wagonPrompt); wagonPrompt = nil
+    end)
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Fuse started (activating player only)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:startFuse')
+AddEventHandler('wagonrobbery:startFuse', function()
+    dbg('startFuse received')
+    missionPhase = 'fuse'
+    notify(TEXTS.FuseWarning)
+
+    -- Countdown thread – mirrors outsider's digging_timer pattern
+    CreateThread(function()
+        local elapsed = 0
+        repeat
+            Wait(1000)
+            elapsed = elapsed + 1000
+            if missionPhase ~= 'fuse' then return end
+        until elapsed >= Config.DynamiteFuseMs
+
+        if missionPhase == 'fuse' then
+            TriggerServerEvent('wagonrobbery:fuseExpired')
+        end
+    end)
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Wagon exploded (all clients)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:wagonExploded')
+AddEventHandler('wagonrobbery:wagonExploded', function()
+    dbg('wagonExploded received')
+
+    if isActivator then
+        -- Local VFX at wagon position
+        if wagonEnt and DoesEntityExist(wagonEnt) then
+            local wc = GetEntityCoords(wagonEnt)
+            AddExplosion(wc.x, wc.y, wc.z, 2, 10.0, true, false, 1.0)
+        end
+        notify(TEXTS.WagonExploded)
+        missionPhase = 'reinforcements'
+        removeBlip()
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Reinforcements spawned (activating player only)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:reinforcementsSpawned')
+AddEventHandler('wagonrobbery:reinforcementsSpawned', function(data)
+    dbg(('reinforcementsSpawned received, count=%d'):format(#data.reinfNetIds))
+
+    missionPhase = 'reinforcements'
+    totalReinf   = #data.reinfNetIds
+    reinfEnts    = {}; reinfHorseEnts = {}
+
+    local myPed    = PlayerPedId()
+    local myCoords = GetEntityCoords(myPed)
+
+    for i, netId in ipairs(data.reinfNetIds) do
+        local r = waitForNetEntity(netId)
+        if r then
+            reinfEnts[#reinfEnts+1] = r
+            applyNpcAI(r, myPed)
+
+            local horseNId = data.reinfHorseNetIds and data.reinfHorseNetIds[i]
+            if horseNId then
+                local horse = waitForNetEntity(horseNId)
+                if horse then
+                    reinfHorseEnts[#reinfHorseEnts+1] = horse
+                    TaskVehicleDriveToCoordLongrange(
+                        r, horse,
+                        myCoords.x, myCoords.y, myCoords.z,
+                        20.0,
+                        Config.WagonDriveMode,
+                        5.0
+                    )
+                end
+            end
+        end
+    end
+
+    dbg(('Reinforcements resolved: %d'):format(#reinfEnts))
+
+    -- Thread: monitor reinf deaths + update target periodically
+    -- Mirrors outsider's repeat-until timer pattern
+    monitorReinfAlive = true
+    local updateAccum = 0
+
+    CreateThread(function()
+        repeat
+            Wait(2000)
+            if not monitorReinfAlive then break end
+            updateAccum = updateAccum + 2000
+
+            -- Player death = reinfs "won"
+            if IsEntityDead(PlayerPedId()) then
+                monitorReinfAlive = false
+                TriggerServerEvent('wagonrobbery:reinforcementsWon')
+                fullReset()
+                break
+            end
+
+            local dead = countDead(reinfEnts)
+            dbg(('Reinfs dead: %d/%d'):format(dead, totalReinf))
+
+            if dead >= totalReinf then
+                monitorReinfAlive = false
+                missionPhase = 'loot'
+                TriggerServerEvent('wagonrobbery:reinforcementsEliminated')
+                notify(TEXTS.ReinfsDead)
+                break
+            end
+
+            -- Re-issue ride task every Config.ReinfUpdateMs so they track the player
+            if updateAccum >= Config.ReinfUpdateMs then
+                updateAccum = 0
+                local nc = GetEntityCoords(PlayerPedId())
+                for idx, r in ipairs(reinfEnts) do
+                    if DoesEntityExist(r) and not IsEntityDead(r) then
+                        local h = reinfHorseEnts[idx]
+                        if h and DoesEntityExist(h) and not IsEntityDead(h) then
+                            TaskVehicleDriveToCoordLongrange(
+                                r, h,
+                                nc.x, nc.y, nc.z,
+                                20.0,
+                                Config.WagonDriveMode,
+                                5.0
+                            )
+                        end
+                    end
+                end
+            end
+        until not monitorReinfAlive
+    end)
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Mission broadcast (ALL clients)
+-- Non-activating players receive this so late joiners also get it via
+-- wagonrobbery:requestSync on session entry.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:missionBroadcast')
+AddEventHandler('wagonrobbery:missionBroadcast', function(data)
+    if isActivator then return end
+    -- Non-activators: nothing to do client-side except optionally show a
+    -- world notification. They can still shoot guards and reinfs normally.
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Mission failed
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:missionFailed')
+AddEventHandler('wagonrobbery:missionFailed', function()
+    notify(TEXTS.MissionFailed)
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- NET EVENT: Cleanup (all clients)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+RegisterNetEvent('wagonrobbery:cleanup')
+AddEventHandler('wagonrobbery:cleanup', function()
+    dbg('cleanup received')
+    fullReset()
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Session join: request current mission state (late joiners)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CreateThread(function()
+    repeat Wait(5000) until LocalPlayer.state.IsInSession
+    TriggerServerEvent('wagonrobbery:requestSync')
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Resource stop – clean up everything we own client-side
+-- Mirrors outsider_grave_robbery's onResourceStop handler
+-- ═══════════════════════════════════════════════════════════════════════════════
 
 AddEventHandler('onResourceStop', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
 
-    for _, enc in pairs(activeEncounters) do
-        removeBlip(enc.blip)
-        deletePrompt(enc.prompt)
+    if starterPedEnt and DoesEntityExist(starterPedEnt) then
+        DeleteEntity(starterPedEnt)
+        starterPedEnt = nil
     end
 
-    activeEncounters = {}
-    isLooting = false
-    currentLootEncounter = nil
+    deletePrompt(starterPrompt); starterPrompt = nil
+    deletePrompt(wagonPrompt);   wagonPrompt   = nil
+    removeBlip()
+    fullReset()
 end)

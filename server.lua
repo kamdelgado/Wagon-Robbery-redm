@@ -1,424 +1,518 @@
 ---@diagnostic disable: undefined-global
 
 --[[
-    server.lua — Wagon Robbery (VORP / RedM)
+    server.lua – Armoured Wagon Robbery
+    ════════════════════════════════════════════════════════════════════════════
 
-    DESIGN PRINCIPLES (fixes for the AI-generated version):
-    ─────────────────────────────────────────────────────────
-    1. The SERVER owns all entity spawning. Wagons and guards are created here,
-       their network IDs are sent to clients. Clients NEVER call CreateVehicle or
-       CreatePed for this script.
+    ARCHITECTURE (derived from outsider_grave_robbery + bcc-robbery patterns):
+    ─────────────────────────────────────────────────────────────────────────
+    • All entity creation (CreateVehicle / CreatePed) is server-side.
+      The client NEVER spawns entities – it resolves netIds sent from here.
+    • A single-active-mission gate + server-side cooldown timer prevent
+      concurrent missions and abuse.
+    • Server-side distance check before every event is accepted (mirrors
+      outsider's exploit detection pattern in check_shovel).
+    • playerDropped triggers full cleanup, exactly as outsider does with
+      DIGGING_GRAVE cleanup.
+    • Job alert event mirrors the outsider_alertjobs pattern exactly.
 
-    2. One robbery per encounter at a time. A server-side state table acts as the
-       single source of truth. Any client trying to start a second robbery on the
-       same encounter is rejected immediately.
-
-    3. Distance is verified on the SERVER using GetEntityCoords(GetPlayerPed(source))
-       before anything is authorised. This blocks teleport exploits.
-
-    4. playerDropped cleans up any in-progress robbery for that player so the
-       encounter doesn't get permanently locked.
+    PHASE STATE MACHINE:
+        idle           – nothing active
+        guards         – wagon moving, guards alive; player must kill them
+        dynamite       – all guards dead; activator approaches wagon for minigame
+        fuse           – minigame passed, 10s countdown running on client
+        reinforcements – wagon blown; 10 reinfs riding toward player
+        loot           – all reinfs dead; activator loots wagon for $300
+        complete       – loot collected; 5-min cleanup timer running
+        cooldown       – between missions (1 hr)
 --]]
 
-local VorpCore  = exports.vorp_core:GetCore()
+local VorpCore = exports.vorp_core:GetCore()
 
--- ─── State ───────────────────────────────────────────────────────────────────
+-- ─── Job Alert Table (mirrors outsider_grave_robbery exactly) ─────────────────
+local JobsTable = {}
 
---[[
-    encounterState[encounterId] = {
-        status        = 'idle' | 'active' | 'cooldown',
-        wagonEntity   = <entity handle>,
-        wagonNetId    = <network id>,
-        guardEntities = { <entity>, … },
-        guardNetIds   = { <netId>, … },
-        robbingPlayer = <source> | nil,
-        cooldownTimer = <timer handle> | nil,
-    }
---]]
-local encounterState = {}
+-- ─── Mission State ────────────────────────────────────────────────────────────
+local M = {
+    phase        = 'idle',
+    player       = nil,     -- source of the activating player
+    cooldownEnd  = 0,       -- os.time() value at which cooldown expires
 
--- Jobs table: players whose job qualifies them for robbery alerts
-local jobAlertPlayers = {}
+    -- Entity handles (server owns these)
+    wagon        = nil,
+    driver       = nil,
+    gunner       = nil,
+    guards       = {},
+    guardHorses  = {},
+    reinfs       = {},
+    reinfHorses  = {},
 
--- ─── Helpers ─────────────────────────────────────────────────────────────────
+    -- Network IDs sent to clients
+    wagonNetId       = nil,
+    driverNetId      = nil,
+    gunnerNetId      = nil,
+    guardNetIds      = {},
+    guardHorseNetIds = {},
+}
 
-local function getState(encounterId)
-    if not encounterState[encounterId] then
-        encounterState[encounterId] = {
-            status        = 'idle',
-            wagonEntity   = nil,
-            wagonNetId    = nil,
-            guardEntities = {},
-            guardNetIds   = {},
-            robbingPlayer = nil,
-            cooldownTimer = nil,
-        }
-    end
-    return encounterState[encounterId]
+-- ─── Helpers ──────────────────────────────────────────────────────────────────
+
+local function dbg(...)
+    if Config.Debug then print('[WagonRobbery]', ...) end
 end
 
-local function isJobInAlertList(job)
-    for _, j in ipairs(Config.JobsToAlert) do
-        if j == job then return true end
-    end
+local function isActive()
+    return M.phase ~= 'idle' and M.phase ~= 'cooldown'
+end
+
+local function isOnCooldown()
+    return M.cooldownEnd > 0 and os.time() < M.cooldownEnd
+end
+
+local function startCooldown()
+    M.cooldownEnd = os.time() + Config.GlobalCooldown
+    dbg(('Cooldown started. Expires at os.time()=%d'):format(M.cooldownEnd))
+end
+
+-- Checks that a table (not counting nils) has at least 1 element – same helper
+-- pattern bcc-robbery uses internally.
+local function tableHasEntry(t)
+    for _ in pairs(t) do return true end
     return false
 end
 
-local function notifyJobHolders(source, encounterId)
-    local enc = Config.Encounters[encounterId]
-    if not enc then return end
+-- ─── NPC Setup (applied after CreatePed server-side) ─────────────────────────
 
-    if Config.UseOutsiderJobAlerts then
-        -- If outsider_jobalerts is installed, use it
-        if exports['outsider_jobalerts'] then
-            exports['outsider_jobalerts']:InsertAlert(source, Config.OutsiderJobAlertCommand)
-        end
-        return
-    end
-
-    for _, holder in pairs(jobAlertPlayers) do
-        if holder.source ~= source then
-            VorpCore.NotifyLeft(
-                holder.source,
-                enc.town,
-                Config.Texts.GuardsAlert,
-                'generic_textures',
-                'temp_pedshot',
-                8000,
-                'COLOR_WHITE'
-            )
-        end
+local function configureNpc(ped, weapon)
+    if not DoesEntityExist(ped) then return end
+    SetPedAccuracy(ped, Config.NpcAccuracy)
+    SetPedCombatAbility(ped, Config.NpcCombatAbility)
+    SetEntityHealth(ped, GetEntityHealth(ped) + Config.NpcBonusHealth)
+    SetPedArmour(ped, Config.NpcArmour)
+    SetPedCombatAttributes(ped, 2,  true)   -- always fight
+    SetPedCombatAttributes(ped, 5,  true)   -- fight armed peds
+    SetPedCombatAttributes(ped, 46, true)   -- use cover
+    SetPedCombatAttributes(ped, 52, true)   -- face enemy
+    SetPedRelationshipGroupHash(ped, `AMBIENT_GANG_WANTED`)
+    if weapon then
+        GiveWeaponToPed(ped, weapon, 999, true, true)
     end
 end
 
---[[
-    Spawn the wagon and guards for an encounter on the server side.
-    Returns true on success, false if something went wrong.
---]]
-local function spawnEncounter(encounterId)
-    local enc = Config.Encounters[encounterId]
-    if not enc then
-        print(('[WagonRobbery] ERROR: no encounter config for id %d'):format(encounterId))
+-- Spawn a ped on a horse; returns (ped, horse) or (nil, nil) on failure.
+local function spawnMounted(pedModel, horseModel, coords, weapon)
+    local x, y, z, h = coords.x, coords.y, coords.z, coords.w
+
+    local horse = CreateVehicle(horseModel, x, y, z, h, true, false)
+    if not DoesEntityExist(horse) then
+        print(('[WagonRobbery] ERROR: CreateVehicle(horse) failed at %s %s %s'):format(x,y,z))
+        return nil, nil
+    end
+    SetEntityDistanceCullingRadius(horse, 0.0)
+
+    local ped = CreatePed(pedModel, x, y, z + 0.5, h, true, false)
+    if not DoesEntityExist(ped) then
+        print(('[WagonRobbery] ERROR: CreatePed failed at %s %s %s'):format(x,y,z))
+        DeleteEntity(horse)
+        return nil, nil
+    end
+    SetEntityDistanceCullingRadius(ped, 0.0)
+    configureNpc(ped, weapon)
+    TaskWarpPedIntoVehicle(ped, horse, -1)  -- -1 = driver/rider seat
+
+    return ped, horse
+end
+
+-- ─── Full Cleanup ─────────────────────────────────────────────────────────────
+
+local function cleanupAll()
+    dbg('cleanupAll() called, phase was: ' .. M.phase)
+
+    local function tryDel(e) if e and DoesEntityExist(e) then DeleteEntity(e) end end
+
+    tryDel(M.wagon); tryDel(M.driver); tryDel(M.gunner)
+    for _, e in ipairs(M.guards)      do tryDel(e) end
+    for _, e in ipairs(M.guardHorses) do tryDel(e) end
+    for _, e in ipairs(M.reinfs)      do tryDel(e) end
+    for _, e in ipairs(M.reinfHorses) do tryDel(e) end
+
+    -- Tell all clients to clear local state, blips, prompts
+    TriggerClientEvent('wagonrobbery:cleanup', -1)
+
+    -- Reset state (preserve cooldownEnd – it keeps ticking after cleanup)
+    M.phase        = 'idle'
+    M.player       = nil
+    M.wagon        = nil; M.driver       = nil; M.gunner    = nil
+    M.guards       = {}; M.guardHorses  = {}
+    M.reinfs       = {}; M.reinfHorses  = {}
+    M.wagonNetId       = nil; M.driverNetId   = nil; M.gunnerNetId  = nil
+    M.guardNetIds  = {}; M.guardHorseNetIds = {}
+
+    dbg('cleanupAll() complete.')
+end
+
+-- ─── Mission Launch ───────────────────────────────────────────────────────────
+
+local function launchMission(src)
+    dbg('launchMission() for source ' .. src)
+    local sc = Config.WagonSpawn
+
+    -- Wagon
+    M.wagon = CreateVehicle(Config.WagonModel, sc.x, sc.y, sc.z, sc.w, true, false)
+    if not DoesEntityExist(M.wagon) then
+        print('[WagonRobbery] FATAL: wagon CreateVehicle failed. Check Config.WagonModel hash.')
         return false
     end
+    M.wagonNetId = NetworkGetNetworkIdFromEntity(M.wagon)
+    SetEntityDistanceCullingRadius(M.wagon, 0.0)
+    dbg('Wagon spawned netId=' .. M.wagonNetId)
 
-    local state = getState(encounterId)
-    if state.status ~= 'idle' then
-        -- Already active or on cooldown — don't double-spawn
-        return false
+    -- Driver (non-combat, drives the wagon)
+    M.driver = CreatePed(Config.DriverModel, sc.x, sc.y, sc.z, sc.w, true, false)
+    if DoesEntityExist(M.driver) then
+        M.driverNetId = NetworkGetNetworkIdFromEntity(M.driver)
+        SetEntityDistanceCullingRadius(M.driver, 0.0)
+        SetPedCombatAbility(M.driver, 0)
+        SetBlockingOfNonTemporaryEvents(M.driver, true)
+        TaskWarpPedIntoVehicle(M.driver, M.wagon, -1)
+    else
+        print('[WagonRobbery] WARNING: driver CreatePed failed.')
+        M.driverNetId = nil
     end
 
-    -- ── Spawn wagon (server-side, OneSync) ──────────────────────────────────
-    local c       = enc.coords
-    local wagon   = CreateVehicle(Config.WagonModel, c.x, c.y, c.z, c.w, true, false)
-
-    if not DoesEntityExist(wagon) then
-        print(('[WagonRobbery] ERROR: CreateVehicle failed for encounter %d'):format(encounterId))
-        return false
+    -- Gatling gunner (turret seat)
+    M.gunner = CreatePed(Config.GunnerModel, sc.x, sc.y, sc.z, sc.w, true, false)
+    if DoesEntityExist(M.gunner) then
+        M.gunnerNetId = NetworkGetNetworkIdFromEntity(M.gunner)
+        SetEntityDistanceCullingRadius(M.gunner, 0.0)
+        configureNpc(M.gunner, Config.GunnerWeapon)
+        TaskWarpPedIntoVehicle(M.gunner, M.wagon, Config.GunnerSeat)
+    else
+        print('[WagonRobbery] WARNING: gunner CreatePed failed.')
+        M.gunnerNetId = nil
     end
 
-    local wagonNetId = NetworkGetNetworkIdFromEntity(wagon)
+    -- 5 Mounted guards
+    M.guards = {}; M.guardHorses = {}
+    M.guardNetIds = {}; M.guardHorseNetIds = {}
 
-    -- Make entity persistent so OneSync doesn't cull it when no player is nearby
-    SetEntityDistanceCullingRadius(wagon, 0.0) -- 0 = no forced culling radius override
-    -- The wagon is owned by the server; freeze it in place (it's a stationary target)
-    FreezeEntityPosition(wagon, true)
-
-    -- ── Spawn guards ────────────────────────────────────────────────────────
-    local guardEntities = {}
-    local guardNetIds   = {}
-
-    for _, gcoords in ipairs(enc.guards) do
-        local guard = CreatePed(
-            Config.GuardModel,
-            gcoords.x, gcoords.y, gcoords.z, gcoords.w,
-            true, false
-        )
-
-        if DoesEntityExist(guard) then
-            -- Arm the guard
-            GiveWeaponToPed(guard, Config.GuardWeapon, 100, true, true)
-            SetPedRelationshipGroupHash(guard, `AMBIENT_GANG_WANTED`)
-            -- Keep guard alive and in place until the robbery starts
-            SetEntityInvincible(guard, true)
-            FreezeEntityPosition(guard, true)
-
-            local gNetId = NetworkGetNetworkIdFromEntity(guard)
-            guardEntities[#guardEntities + 1] = guard
-            guardNetIds[#guardNetIds + 1]     = gNetId
-        else
-            print(('[WagonRobbery] WARNING: CreatePed failed for a guard in encounter %d'):format(encounterId))
+    for _, gc in ipairs(Config.GuardSpawns) do
+        local ped, horse = spawnMounted(Config.GuardModel, Config.GuardHorse, gc, Config.GuardWeapon)
+        if ped and horse then
+            M.guards[#M.guards+1]           = ped
+            M.guardHorses[#M.guardHorses+1] = horse
+            M.guardNetIds[#M.guardNetIds+1]            = NetworkGetNetworkIdFromEntity(ped)
+            M.guardHorseNetIds[#M.guardHorseNetIds+1]  = NetworkGetNetworkIdFromEntity(horse)
         end
     end
 
-    -- ── Update state ────────────────────────────────────────────────────────
-    state.status        = 'active'
-    state.wagonEntity   = wagon
-    state.wagonNetId    = wagonNetId
-    state.guardEntities = guardEntities
-    state.guardNetIds   = guardNetIds
-    state.robbingPlayer = nil
+    dbg(('Guards spawned: %d/%d requested'):format(#M.guards, #Config.GuardSpawns))
 
-    -- ── Tell ALL clients about the new encounter ─────────────────────────────
-    TriggerClientEvent('wagonrobbery:syncEncounter', -1, encounterId, wagonNetId, guardNetIds)
+    -- Update state before triggering client events
+    M.phase  = 'guards'
+    M.player = src
+    startCooldown()
 
-    print(('[WagonRobbery] Encounter %d spawned. Wagon netId: %d, Guards: %d'):format(
-        encounterId, wagonNetId, #guardNetIds
-    ))
+    -- Total hostiles the activating client monitors (guards + gunner if alive)
+    local totalHostiles = #M.guards + (M.gunnerNetId and 1 or 0)
+
+    -- Tell the activating client everything it needs
+    TriggerClientEvent('wagonrobbery:missionStarted', src, {
+        wagonNetId       = M.wagonNetId,
+        driverNetId      = M.driverNetId,
+        gunnerNetId      = M.gunnerNetId,
+        guardNetIds      = M.guardNetIds,
+        guardHorseNetIds = M.guardHorseNetIds,
+        totalHostiles    = totalHostiles,
+        wagonDest        = Config.WagonDest,
+    })
+
+    -- Broadcast to all OTHER clients so they can see/participate but won't get
+    -- blip or prompts (only activator gets those)
+    TriggerClientEvent('wagonrobbery:missionBroadcast', -1, {
+        wagonNetId  = M.wagonNetId,
+        activatorSrc = src,
+    })
+
+    -- Job alert after 10 s delay (identical to outsider_grave_robbery)
+    SetTimeout(10000, function()
+        if M.phase ~= 'idle' then
+            TriggerEvent('wagonrobbery:alertJobs', src)
+        end
+    end)
+
+    -- Safety-net mission timeout (kicks in if activator goes AFK)
+    SetTimeout(Config.MissionTimeout * 1000, function()
+        if isActive() and M.player == src then
+            dbg('Mission timeout reached for source ' .. src .. '. Cleaning up.')
+            cleanupAll()
+        end
+    end)
+
+    dbg('launchMission() complete.')
     return true
 end
 
---[[
-    Clean up all entities for an encounter and begin the cooldown timer.
---]]
-local function despawnEncounter(encounterId)
-    local state = getState(encounterId)
+-- ─── Reinforcement Spawn ──────────────────────────────────────────────────────
 
-    -- Delete wagon
-    if state.wagonEntity and DoesEntityExist(state.wagonEntity) then
-        DeleteEntity(state.wagonEntity)
-    end
+local function spawnReinforcements()
+    dbg(('Spawning %d reinforcements...'):format(Config.ReinfCount))
+    M.reinfs = {}; M.reinfHorses = {}
+    local reinfNetIds = {}; local reinfHorseNetIds = {}
 
-    -- Delete guards
-    for _, guard in ipairs(state.guardEntities) do
-        if DoesEntityExist(guard) then
-            DeleteEntity(guard)
+    local rc = Config.ReinfSpawn
+    for i = 1, Config.ReinfCount do
+        -- Scatter slightly so they don't all stack on one spot
+        local ox = ((i-1) % 4) * 4.0 - 6.0
+        local oy = math.floor((i-1) / 4) * 5.0
+        local sc = vector4(rc.x+ox, rc.y+oy, rc.z, rc.w)
+
+        local ped, horse = spawnMounted(Config.ReinfModel, Config.ReinfHorse, sc, Config.ReinfWeapon)
+        if ped and horse then
+            M.reinfs[#M.reinfs+1]           = ped
+            M.reinfHorses[#M.reinfHorses+1] = horse
+            reinfNetIds[#reinfNetIds+1]           = NetworkGetNetworkIdFromEntity(ped)
+            reinfHorseNetIds[#reinfHorseNetIds+1] = NetworkGetNetworkIdFromEntity(horse)
         end
     end
 
-    state.status        = 'cooldown'
-    state.wagonEntity   = nil
-    state.wagonNetId    = nil
-    state.guardEntities = {}
-    state.guardNetIds   = {}
-    state.robbingPlayer = nil
+    M.phase = 'reinforcements'
 
-    -- Tell ALL clients to remove blips / local references
-    TriggerClientEvent('wagonrobbery:clearEncounter', -1, encounterId)
+    TriggerClientEvent('wagonrobbery:reinforcementsSpawned', M.player, {
+        reinfNetIds      = reinfNetIds,
+        reinfHorseNetIds = reinfHorseNetIds,
+    })
 
-    -- After cooldown, mark as idle and re-spawn
-    if state.cooldownTimer then
-        -- Cancel any previous timer (shouldn't happen, but be safe)
-        state.cooldownTimer = nil
-    end
-
-    state.cooldownTimer = SetTimeout(Config.CooldownMinutes * 60000, function()
-        state.status        = 'idle'
-        state.cooldownTimer = nil
-        spawnEncounter(encounterId)
-    end)
-
-    print(('[WagonRobbery] Encounter %d despawned. Respawning in %d minutes.'):format(
-        encounterId, Config.CooldownMinutes
-    ))
+    dbg(('Reinforcements spawned: %d'):format(#M.reinfs))
 end
 
--- ─── Resource Lifecycle ──────────────────────────────────────────────────────
+-- ─── Resource Lifecycle ───────────────────────────────────────────────────────
 
-AddEventHandler('onResourceStart', function(resourceName)
-    if GetCurrentResourceName() ~= resourceName then return end
-    -- Small delay so VorpCore has time to initialise
-    SetTimeout(2000, function()
-        for i, _ in ipairs(Config.Encounters) do
-            spawnEncounter(i)
-        end
-    end)
+AddEventHandler('onResourceStart', function(name)
+    if GetCurrentResourceName() ~= name then return end
+    dbg('Resource started.')
 end)
 
-AddEventHandler('onResourceStop', function(resourceName)
-    if GetCurrentResourceName() ~= resourceName then return end
-    for i, _ in ipairs(Config.Encounters) do
-        local state = getState(i)
-        if state.wagonEntity and DoesEntityExist(state.wagonEntity) then
-            DeleteEntity(state.wagonEntity)
-        end
-        for _, guard in ipairs(state.guardEntities) do
-            if DoesEntityExist(guard) then DeleteEntity(guard) end
-        end
-    end
+AddEventHandler('onResourceStop', function(name)
+    if GetCurrentResourceName() ~= name then return end
+    cleanupAll()
 end)
 
--- ─── Player Character Selected (for job alert table) ─────────────────────────
+-- ─── Job Alert (outsider_grave_robbery pattern, verbatim structure) ───────────
 
-AddEventHandler('vorp:SelectedCharacter', function(source, char)
-    if isJobInAlertList(char.job) then
-        jobAlertPlayers[source] = { source = source, job = char.job }
+AddEventHandler('vorp:SelectedCharacter', function(src, char)
+    local job = char.job
+    for _, j in ipairs(Config.JobsToAlert) do
+        if j == job then
+            JobsTable[#JobsTable+1] = { source = src, job = job }
+            break
+        end
     end
 end)
 
 AddEventHandler('playerDropped', function()
     local src = source
-    jobAlertPlayers[src] = nil
 
-    -- If this player was mid-robbery, cancel it and re-activate guards
-    for i, _ in ipairs(Config.Encounters) do
-        local state = getState(i)
-        if state.robbingPlayer == src then
-            state.robbingPlayer = nil
-            -- Re-freeze guards (they were made mortal for the fight)
-            for _, guard in ipairs(state.guardEntities) do
-                if DoesEntityExist(guard) then
-                    SetEntityInvincible(guard, true)
-                    FreezeEntityPosition(guard, true)
-                end
-            end
-            TriggerClientEvent('wagonrobbery:robberyCancelled', -1, i)
-            print(('[WagonRobbery] Player %d dropped mid-robbery of encounter %d — cancelled.'):format(src, i))
+    -- Remove from job table (outsider pattern)
+    for idx, v in pairs(JobsTable) do
+        if v.source == src then JobsTable[idx] = nil end
+    end
+
+    -- If this player was the activating player, clean up
+    if isActive() and M.player == src then
+        dbg('Activating player ' .. src .. ' dropped. Cleaning up mission.')
+        cleanupAll()
+    end
+end)
+
+AddEventHandler('wagonrobbery:alertJobs', function(src)
+    -- outsider_jobalerts integration (mirrors outsider_grave_robbery exactly)
+    if Config.UseOutsiderJobAlerts then
+        if exports['outsider_jobalerts'] then
+            exports['outsider_jobalerts']:InsertAlert(src, Config.OutsiderJobAlertCmd)
+        end
+        return
+    end
+
+    for _, jobHolder in pairs(JobsTable) do
+        if jobHolder.source ~= src then
+            VorpCore.NotifyLeft(
+                jobHolder.source,
+                'Armoured Wagon',
+                'A wagon robbery has been reported!',
+                Config.Textures.alert[1],
+                Config.Textures.alert[2],
+                8000,
+                'COLOR_WHITE'
+            )
         end
     end
 end)
 
--- ─── Server Events (called by clients) ───────────────────────────────────────
+-- ─── Server Events ────────────────────────────────────────────────────────────
 
---[[
-    Client requests to start robbing an encounter.
-    Server validates distance, item ownership, and encounter state before authorising.
---]]
-RegisterServerEvent('wagonrobbery:requestRob', function(encounterId)
-    local src   = source
-    local state = getState(encounterId)
+-- 1. Player held E on starter ped ─────────────────────────────────────────────
+RegisterServerEvent('wagonrobbery:requestStart')
+AddEventHandler('wagonrobbery:requestStart', function()
+    local src = source
 
-    -- ── Guard: encounter must be active ─────────────────────────────────────
-    if state.status ~= 'active' then
-        VorpCore.NotifyRightTip(src, Config.Texts.AlreadyRobbed, 4000)
+    -- Cooldown gate
+    if isOnCooldown() then
+        VorpCore.NotifyRightTip(src, Config.Texts.OnCooldown, 6000)
         return
     end
 
-    -- ── Guard: only one player can rob at a time ─────────────────────────────
-    if state.robbingPlayer ~= nil then
-        VorpCore.NotifyRightTip(src, Config.Texts.InProgress, 4000)
+    -- Single-active gate
+    if isActive() then
+        VorpCore.NotifyRightTip(src, Config.Texts.MissionAlreadyActive, 5000)
         return
     end
 
-    -- ── Guard: distance check (server-side) ──────────────────────────────────
+    -- Distance check vs starter ped (server-side, mirrors outsider exploit detection)
     local playerCoords = GetEntityCoords(GetPlayerPed(src))
-    local wagonCoords  = GetEntityCoords(state.wagonEntity)
-    local distance     = #(playerCoords - wagonCoords)
-
-    if distance > Config.MaxRobDistance then
-        print(('[WagonRobbery] Exploit attempt: %s tried to rob encounter %d from %.1f units away.'):format(
-            GetPlayerName(src), encounterId, distance
-        ))
-        VorpCore.NotifyRightTip(src, Config.Texts.TooFar, 4000)
+    local pedCoords    = Config.StarterPed.coords
+    local dist = #(playerCoords - vector3(pedCoords.x, pedCoords.y, pedCoords.z))
+    if dist > 15.0 then
+        print(('[WagonRobbery] Exploit? %s triggered requestStart from %.1fm away.'):format(GetPlayerName(src), dist))
         return
     end
 
-    -- ── Guard: required item check ───────────────────────────────────────────
-    if Config.RequiredItem then
-        local item = exports.vorp_inventory:getItem(src, Config.RequiredItem)
-        if not item then
-            VorpCore.NotifyRightTip(src, Config.Texts.NoItem, 4000)
+    -- Item check + consume (mirrors outsider check_shovel pattern)
+    local item = exports.vorp_inventory:getItem(src, Config.RequiredItem)
+    if not item then
+        VorpCore.NotifyRightTip(src, Config.Texts.NeedDynamite, 5000)
+        return
+    end
+    exports.vorp_inventory:subItem(src, Config.RequiredItem, 1)
+
+    local ok = launchMission(src)
+    if not ok then
+        -- Refund on spawn failure
+        exports.vorp_inventory:addItem(src, Config.RequiredItem, 1)
+        VorpCore.NotifyRightTip(src, 'Server error: failed to spawn mission. Refunding item.', 5000)
+    end
+end)
+
+-- 2. Activating client reports all guards dead ────────────────────────────────
+RegisterServerEvent('wagonrobbery:guardsEliminated')
+AddEventHandler('wagonrobbery:guardsEliminated', function()
+    local src = source
+    if not isActive() or M.player ~= src or M.phase ~= 'guards' then return end
+    M.phase = 'dynamite'
+    dbg('Phase → dynamite')
+end)
+
+-- 3. Activating client passed the minigame → dynamite placed ──────────────────
+RegisterServerEvent('wagonrobbery:dynamitePlaced')
+AddEventHandler('wagonrobbery:dynamitePlaced', function()
+    local src = source
+    if not isActive() or M.player ~= src or M.phase ~= 'dynamite' then return end
+
+    -- Server-side distance check: player must still be near the wagon
+    if M.wagon and DoesEntityExist(M.wagon) then
+        local playerCoords = GetEntityCoords(GetPlayerPed(src))
+        local wagonCoords  = GetEntityCoords(M.wagon)
+        if #(playerCoords - wagonCoords) > Config.WagonTriggerDist + 5.0 then
+            print(('[WagonRobbery] Exploit? %s sent dynamitePlaced from too far away.'):format(GetPlayerName(src)))
             return
         end
     end
 
-    -- ── All checks passed — authorise ────────────────────────────────────────
-    state.robbingPlayer = src
-
-    -- Make guards mortal and unfreeze so they react
-    for _, guard in ipairs(state.guardEntities) do
-        if DoesEntityExist(guard) then
-            SetEntityInvincible(guard, false)
-            FreezeEntityPosition(guard, false)
-        end
-    end
-
-    -- Tell the robbing player to start the loot sequence
-    TriggerClientEvent('wagonrobbery:beginLoot', src, encounterId)
-
-    -- Tell all other clients guards have been activated (so they see the fight)
-    TriggerClientEvent('wagonrobbery:guardsAlerted', -1, encounterId)
-
-    -- Set a server-side timeout in case the player disconnects or walks away
-    -- without completing (prevents encounter being permanently locked)
-    SetTimeout(Config.RobberyTimeout * 1000, function()
-        local freshState = getState(encounterId)
-        if freshState.robbingPlayer == src then
-            freshState.robbingPlayer = nil
-            -- Re-freeze guards
-            for _, guard in ipairs(freshState.guardEntities) do
-                if DoesEntityExist(guard) then
-                    SetEntityInvincible(guard, true)
-                    FreezeEntityPosition(guard, true)
-                end
-            end
-            TriggerClientEvent('wagonrobbery:robberyCancelled', -1, encounterId)
-            print(('[WagonRobbery] Encounter %d robbery timed out for player %d.'):format(encounterId, src))
-        end
-    end)
-
-    -- Notify law enforcement (10 second delay for realism)
-    SetTimeout(10000, function()
-        notifyJobHolders(src, encounterId)
-    end)
+    M.phase = 'fuse'
+    dbg('Phase → fuse')
+    TriggerClientEvent('wagonrobbery:startFuse', src)
 end)
 
---[[
-    Client reports that the loot sequence completed successfully.
---]]
-RegisterServerEvent('wagonrobbery:completeLoot', function(encounterId)
-    local src   = source
-    local state = getState(encounterId)
-
-    -- Anti-exploit: only the registered robber can complete it
-    if state.robbingPlayer ~= src then
-        print(('[WagonRobbery] Exploit attempt: %s tried to complete encounter %d but is not the robber.'):format(
-            GetPlayerName(src), encounterId
-        ))
-        return
-    end
-
-    -- ── Roll loot ────────────────────────────────────────────────────────────
-    local foundAnything = false
-
-    for _, loot in ipairs(Config.Loot) do
-        if math.random() <= loot.chance then
-            local canCarry = exports.vorp_inventory:canCarryItem(src, loot.item, loot.amount)
-            if canCarry then
-                exports.vorp_inventory:addItem(src, loot.item, loot.amount)
-                VorpCore.NotifyRightTip(src, Config.Texts.FoundItem .. ' ' .. loot.label, 5000)
-                foundAnything = true
-            end
-        end
-    end
-
-    if not foundAnything then
-        VorpCore.NotifyRightTip(src, Config.Texts.NothingFound, 4000)
-    end
-
-    -- ── Despawn and start cooldown ────────────────────────────────────────────
-    despawnEncounter(encounterId)
-end)
-
---[[
-    Client reports the robbery was interrupted (player cancelled, guards killed player, etc.)
---]]
-RegisterServerEvent('wagonrobbery:cancelRob', function(encounterId)
-    local src   = source
-    local state = getState(encounterId)
-
-    if state.robbingPlayer ~= src then return end
-
-    state.robbingPlayer = nil
-    for _, guard in ipairs(state.guardEntities) do
-        if DoesEntityExist(guard) then
-            SetEntityInvincible(guard, true)
-            FreezeEntityPosition(guard, true)
-        end
-    end
-    TriggerClientEvent('wagonrobbery:robberyCancelled', -1, encounterId)
-end)
-
---[[
-    A client asks for the current state of all encounters (called on spawn/character select
-    so late joiners get the active wagon positions).
---]]
-RegisterServerEvent('wagonrobbery:requestSync', function()
+-- 4. Client fuse timer expired → blow wagon, spawn reinfs ─────────────────────
+RegisterServerEvent('wagonrobbery:fuseExpired')
+AddEventHandler('wagonrobbery:fuseExpired', function()
     local src = source
-    for i, _ in ipairs(Config.Encounters) do
-        local state = getState(i)
-        if state.status == 'active' then
-            TriggerClientEvent('wagonrobbery:syncEncounter', src, i, state.wagonNetId, state.guardNetIds)
+    if not isActive() or M.player ~= src or M.phase ~= 'fuse' then return end
+
+    -- Explode the wagon server-side
+    if M.wagon and DoesEntityExist(M.wagon) then
+        NetworkExplodeVehicle(M.wagon, true, false, false)
+    end
+
+    TriggerClientEvent('wagonrobbery:wagonExploded', -1)
+    spawnReinforcements()
+    dbg('Phase → reinforcements')
+end)
+
+-- 5. All reinforcements dead ──────────────────────────────────────────────────
+RegisterServerEvent('wagonrobbery:reinforcementsEliminated')
+AddEventHandler('wagonrobbery:reinforcementsEliminated', function()
+    local src = source
+    if not isActive() or M.player ~= src or M.phase ~= 'reinforcements' then return end
+    M.phase = 'loot'
+    dbg('Phase → loot')
+end)
+
+-- 6. Player completed loot hold-E → pay out ───────────────────────────────────
+RegisterServerEvent('wagonrobbery:lootComplete')
+AddEventHandler('wagonrobbery:lootComplete', function()
+    local src = source
+    if not isActive() or M.player ~= src or M.phase ~= 'loot' then return end
+    M.phase = 'complete'
+
+    -- Distance check
+    if M.wagon and DoesEntityExist(M.wagon) then
+        local playerCoords = GetEntityCoords(GetPlayerPed(src))
+        local wagonCoords  = GetEntityCoords(M.wagon)
+        if #(playerCoords - wagonCoords) > Config.WagonTriggerDist + 5.0 then
+            print(('[WagonRobbery] Exploit? %s sent lootComplete from too far away.'):format(GetPlayerName(src)))
+            M.phase = 'loot'
+            return
         end
     end
+
+    -- Pay reward (mirrors vorp_core addCurrency pattern from bcc-robbery)
+    local user = VorpCore.getUser(src)
+    if user then
+        local char = user.getUsedCharacter
+        if char then
+            char.addCurrency(0, Config.CashReward)
+            VorpCore.NotifyRightTip(src, Config.Texts.MissionComplete, 7000)
+            dbg(('Paid $%d to source %d'):format(Config.CashReward, src))
+        end
+    end
+
+    -- Start the 5-minute cleanup timer
+    SetTimeout(Config.CleanupDelay, function()
+        if M.phase == 'complete' then
+            dbg('Cleanup delay elapsed after mission complete.')
+            cleanupAll()
+        end
+    end)
+end)
+
+-- 7. Activating player died mid-mission ───────────────────────────────────────
+RegisterServerEvent('wagonrobbery:playerDied')
+AddEventHandler('wagonrobbery:playerDied', function()
+    local src = source
+    if not isActive() or M.player ~= src then return end
+    dbg('Activating player died. Cleaning up.')
+    cleanupAll()
+end)
+
+-- 8. Reinforcements reached the player / player fled too long ──────────────────
+RegisterServerEvent('wagonrobbery:reinforcementsWon')
+AddEventHandler('wagonrobbery:reinforcementsWon', function()
+    local src = source
+    if not isActive() or M.player ~= src then return end
+    dbg('Reinforcements won. Cleaning up.')
+    TriggerClientEvent('wagonrobbery:missionFailed', src)
+    cleanupAll()
+end)
+
+-- 9. Late-joining client asks for current mission state ────────────────────────
+RegisterServerEvent('wagonrobbery:requestSync')
+AddEventHandler('wagonrobbery:requestSync', function()
+    local src = source
+    if not isActive() then return end
+    -- Send them the broadcast so they see the wagon blip (non-activators)
+    TriggerClientEvent('wagonrobbery:missionBroadcast', src, {
+        wagonNetId   = M.wagonNetId,
+        activatorSrc = M.player,
+    })
 end)

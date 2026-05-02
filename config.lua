@@ -1,101 +1,162 @@
+---@diagnostic disable: undefined-global
+
 Config = {}
 
--- How long (minutes) before the same robbery location respawns after completion
-Config.CooldownMinutes = 15
+-- ─── Dev / Debug ──────────────────────────────────────────────────────────────
+Config.Debug = false   -- Set true to enable server-side debug prints
 
--- How long (seconds) before an abandoned robbery auto-cancels (player walked away, died, etc.)
-Config.RobberyTimeout = 120
+-- ─── Mission Gating ───────────────────────────────────────────────────────────
+-- Item that must be in inventory to start the mission (1 unit is consumed on start)
+Config.RequiredItem    = 'dynamite'
 
--- Distance (units) within which a player can see the prompt to rob
-Config.TriggerDistance = 10.0
+-- Global cooldown in SECONDS after a mission completes or is cleaned up (1 hr)
+Config.GlobalCooldown  = 3600
 
--- Distance (units) the server validates the player must be within before allowing robbery start
--- Kept tighter than TriggerDistance to prevent position exploits
-Config.MaxRobDistance = 15.0
+-- Seconds before a partially-running mission is force-cleaned if the activating
+-- player does nothing (anti-grief / server-restart safety net)
+Config.MissionTimeout  = 600
 
--- How long the lockpick / loot progress bar runs (ms)
-Config.LootDuration = 8000
+-- Delay in MS after mission COMPLETE before all spawned entities are deleted
+Config.CleanupDelay    = 300000   -- 5 minutes
 
--- Required item to start the robbery (set to nil to require nothing)
-Config.RequiredItem = 'lockpick'
+-- ─── Starter NPC ──────────────────────────────────────────────────────────────
+-- The static, invincible mission-start ped near the Tesla Tower (Roanoke Ridge).
+-- Hold E within 5 m to begin. Matching outsider_grave_robbery's proximity pattern.
+--
+-- Tesla Tower (Roanoke Ridge, New Hanover) is approx. (2362, -666, 155).
+-- !! VERIFY IN-GAME and adjust coords to put the ped on solid ground beside it !!
+Config.StarterPed = {
+    model  = `U_M_M_RnkExp_01`,                      -- Scientist/ranger type – VERIFY
+    coords = vector4(2362.4, -666.5, 155.3, 246.0),  -- VERIFY IN-GAME
+}
 
--- Prompt key binding
-Config.PromptKey = 0x760A9C6F -- INPUT_CONTEXT
+-- How close (metres) the player must be to see / interact with the starter ped
+Config.PedTriggerDist  = 5.0
 
--- Wagon model hash to spawn (stagecoach)
-Config.WagonModel = `stagecoach`
+-- ─── Prompt Key ───────────────────────────────────────────────────────────────
+-- INPUT_CONTEXT = the standard RedM "E" interaction key
+Config.PromptKey = 0x760A9C6F
 
--- Guard ped model hash
-Config.GuardModel = `A_M_M_RanchWorker01`
+-- ─── syn_minigame Parameters ─────────────────────────────────────────────────
+-- Used for the dynamite-placement interaction (replaces a plain hold-E progress bar
+-- with the proper skill-check minigame used by outsider / bcc scripts).
+-- taskBar(difficulty, skillGap)
+--   difficulty : higher = bar moves faster / harder.  ~5000 = medium-hard.
+--   skillGap   : width of the "good zone".  7 = moderate, lower = harder.
+Config.Minigame = {
+    difficulty = 5000,
+    skillGap   = 7,
+}
 
--- Guard weapon hash
+-- ─── Wagon ────────────────────────────────────────────────────────────────────
+-- Spawn: road just outside Fort Wallace (New Hanover) – VERIFY IN-GAME
+-- Dest : The Loft (Heartlands, New Hanover)            – VERIFY IN-GAME
+Config.WagonModel = `security_wagon`     -- VERIFY – should be the armoured variant
+Config.WagonSpawn = vector4(2676.0, -1205.0, 44.8, 175.0)   -- VERIFY
+Config.WagonDest  = vector3(476.0,  416.0,  111.0)           -- VERIFY
+
+Config.WagonSpeed     = 12.0      -- m/s
+-- 786603 = DRIVINGMODE_NORMAL (uses roads, avoids peds, no off-road shortcuts)
+Config.WagonDriveMode = 786603
+
+-- How close to the wagon the player must be for wagon-stage prompts
+Config.WagonTriggerDist = 5.0
+
+-- ─── Driver NPC ───────────────────────────────────────────────────────────────
+Config.DriverModel = `U_M_M_BlwSciExp_01`   -- VERIFY
+
+-- ─── Gatling Gunner ───────────────────────────────────────────────────────────
+Config.GunnerModel  = `G_M_M_SpecOps_01`    -- VERIFY
+Config.GunnerWeapon = `WEAPON_MINIGUN`
+-- Vehicle seat index: -1=driver, 0=front passenger/turret, 1+ = rear
+Config.GunnerSeat   = 0
+
+-- ─── Mounted Guards (5 escorts) ──────────────────────────────────────────────
+Config.GuardModel  = `G_M_M_SpecOps_01`             -- VERIFY
+Config.GuardHorse  = `a_c_horse_morgan_flaxenchestnut` -- VERIFY
 Config.GuardWeapon = `WEAPON_REVOLVER_CATTLEMAN`
 
--- Blip shown on map when wagon is active
-Config.ActiveBlip = {
-    sprite  = -1117567375, -- wagon blip sprite
-    color   = 1,           -- red
-    scale   = 0.8,
-    label   = 'Wagon Robbery',
+-- World positions for 5 mounted guards, scattered around the wagon spawn.
+-- VERIFY IN-GAME – must be on or very near the road.
+Config.GuardSpawns = {
+    vector4(2671.0, -1200.0, 44.8, 175.0),
+    vector4(2674.0, -1197.0, 44.8, 175.0),
+    vector4(2678.0, -1194.0, 44.8, 175.0),
+    vector4(2682.0, -1200.0, 44.8, 175.0),
+    vector4(2685.0, -1197.0, 44.8, 175.0),
 }
 
--- Job alerts – which jobs get notified when a robbery starts
+-- ─── Reinforcements (10 riders) ──────────────────────────────────────────────
+Config.ReinfCount        = 10
+Config.ReinfModel        = `G_M_M_SpecOps_01`             -- VERIFY
+Config.ReinfHorse        = `a_c_horse_morgan_flaxenchestnut` -- VERIFY
+Config.ReinfWeapon       = `WEAPON_REVOLVER_SCHOFIELD`
+
+-- Spawn point ~300 m from The Loft on the nearest road. VERIFY IN-GAME.
+Config.ReinfSpawn        = vector4(780.0, 420.0, 112.0, 270.0)
+
+-- How often (ms) the activating client re-issues the "ride toward player" task
+-- for reinforcements (keeps them tracking a moving player)
+Config.ReinfUpdateMs     = 6000
+
+-- ─── NPC Combat Stats ────────────────────────────────────────────────────────
+-- Matching the high-stat "professional" guards used by bcc-robbery & bcc-legendaries
+Config.NpcAccuracy      = 75   -- 0–100
+Config.NpcCombatAbility = 2    -- 0=poor 1=average 2=professional
+Config.NpcBonusHealth   = 150  -- Added onto default NPC health pool
+Config.NpcArmour        = 100
+
+-- ─── Dynamite Fuse ────────────────────────────────────────────────────────────
+Config.DynamiteFuseMs = 10000  -- 10 seconds from placement to explosion
+
+-- ─── Reward ───────────────────────────────────────────────────────────────────
+Config.CashReward = 300        -- $300 cash (addCurrency type 0)
+
+-- ─── Blip (activating player only) ───────────────────────────────────────────
+Config.Blip = {
+    sprite = -1117567375,   -- wagon blip sprite
+    scale  = 0.8,
+    color  = 1,             -- red
+    label  = 'Armoured Wagon',
+}
+
+-- ─── Job Alerts ───────────────────────────────────────────────────────────────
+-- Mirrors outsider_grave_robbery's job-alert pattern exactly.
 Config.JobsToAlert = { 'sheriff', 'marshall' }
 
--- Whether to use the outsider_jobalerts resource for job notifications
+-- Set true if outsider_jobalerts resource is installed on your server.
 Config.UseOutsiderJobAlerts = false
-Config.OutsiderJobAlertCommand = 'wagonrobbery'
+Config.OutsiderJobAlertCmd  = 'wagonrobbery'  -- command registered in outsider_jobalerts
 
--- Loot table: each entry rolls separately. 'chance' is 0.0–1.0
-Config.Loot = {
-    { item = 'goldnugget',  amount = 2, chance = 0.6,  label = 'Gold Nugget' },
-    { item = 'money',       amount = 50, chance = 0.8, label = 'Cash' },
-    { item = 'whiskey',     amount = 1, chance = 0.4,  label = 'Whiskey' },
-    { item = 'ammo_rifle',  amount = 20, chance = 0.3, label = 'Rifle Ammo' },
-}
-
--- Robbery encounter locations
--- coords  = where the wagon spawns (vector4: x,y,z,heading)
--- guards  = table of guard spawn positions relative to wagon (or world coords)
--- town    = district name shown in job alerts
-Config.Encounters = {
-    {
-        id      = 1,
-        name    = 'Flat Iron Lake Road',
-        town    = 'Blackwater',
-        coords  = vector4(-862.35, -1280.22, 43.85, 270.0),
-        guards  = {
-            vector4(-855.0, -1280.22, 43.85, 90.0),
-            vector4(-870.0, -1278.0,  43.85, 80.0),
-        },
-    },
-    {
-        id      = 2,
-        name    = 'Flat Neck Station Road',
-        town    = 'Valentine',
-        coords  = vector4(-289.47, 774.2, 117.38, 130.0),
-        guards  = {
-            vector4(-283.0, 780.0, 117.38, 310.0),
-            vector4(-296.0, 769.0, 117.38, 130.0),
-        },
-    },
-}
-
--- Notification textures (used with VorpCore left-tip notifications)
-Config.Textures = {
-    alert = { 'generic_textures', 'hud_corner' },
-}
-
+-- ─── Texts ────────────────────────────────────────────────────────────────────
 Config.Texts = {
-    Prompt          = 'Rob Wagon',
-    TooFar          = 'You are too far from the wagon.',
-    AlreadyRobbed   = 'This wagon has already been robbed.',
-    InProgress      = 'Someone else is already robbing this wagon.',
-    NoItem          = 'You need a lockpick to rob this wagon.',
-    RobberyStart    = 'You begin breaking into the strongbox...',
-    RobberySuccess  = 'You loot the wagon!',
-    RobberyFail     = 'The robbery failed.',
-    FoundItem       = 'You found',
-    NothingFound    = 'The strongbox was empty.',
-    GuardsAlert     = 'A wagon robbery has been reported!',
+    -- Starter ped prompt (what the player sees on the hold-E circle)
+    StartPrompt         = 'Armoured Wagon Robbery',
+
+    -- Notification shown to the activating player on mission begin
+    MissionStarted      = 'Armoured Wagon Robbery Mission Has Began',
+
+    -- Rejection messages
+    NeedDynamite        = 'You need dynamite in your inventory to start this mission.',
+    MissionAlreadyActive= 'An armoured wagon robbery is already in progress.',
+    OnCooldown          = 'The armoured wagon is not available right now. Try again later.',
+
+    -- In-mission guidance
+    KillGuards          = 'Eliminate all guards to approach the wagon.',
+    AllGuardsDead       = 'Guards eliminated! Approach the wagon to place dynamite.',
+    PlaceDynamitePrompt = 'Place Dynamite',
+    DynamitePlaced      = 'Dynamite placed! Get back!',
+    FuseWarning         = 'Detonating in 10 seconds!',
+    WagonExploded       = 'The wagon has been blown open! Reinforcements are incoming!',
+    ReinfsDead          = 'Reinforcements down! Loot the wagon.',
+    LootPrompt          = 'Loot Strongbox',
+    MissionComplete     = 'Mission complete! You have been paid $300.',
+    MissionFailed       = 'Mission failed.',
+    MinigameFailed      = 'You failed to place the dynamite.',
+}
+
+-- ─── Textures (notification icons) ───────────────────────────────────────────
+-- Matches outsider_grave_robbery Config.Textures pattern
+Config.Textures = {
+    alert = { 'generic_textures', 'temp_pedshot' },
 }
